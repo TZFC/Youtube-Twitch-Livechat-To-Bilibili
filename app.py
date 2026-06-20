@@ -10,7 +10,7 @@ import os
 import sys
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 import uvicorn
 
 from googleapiclient.discovery import build
@@ -476,11 +476,13 @@ async def run_youtube_and_twitch_to_bilibili_chat_bridge():
     bridge_message_queue = asyncio.Queue(maxsize=50)
 
     try:
-        async with asyncio.TaskGroup() as bridge_task_group:
-            bridge_task_group.create_task(listen_to_youtube_chat_and_queue_messages(bridge_message_queue, config.get("YOUTUBE_CHANNEL_HANDLE", "")))
-            bridge_task_group.create_task(listen_to_twitch_chat_and_queue_messages(bridge_message_queue))
-            bridge_task_group.create_task(send_queued_messages_to_bilibili_live_room(bridge_message_queue))
-    except* Exception:
+        await asyncio.gather(
+            listen_to_youtube_chat_and_queue_messages(bridge_message_queue, config.get("YOUTUBE_CHANNEL_HANDLE", "")),
+            listen_to_twitch_chat_and_queue_messages(bridge_message_queue),
+            send_queued_messages_to_bilibili_live_room(bridge_message_queue),
+            return_exceptions=True
+        )
+    except Exception:
         pass
 
 
@@ -489,6 +491,10 @@ async def run_youtube_and_twitch_to_bilibili_chat_bridge():
 def get_ui():
     with open("index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
+
+@app.get("/favicon.ico")
+def get_favicon():
+    return FileResponse("favicon.ico")
 
 @app.get("/api/config")
 def api_get_config():
