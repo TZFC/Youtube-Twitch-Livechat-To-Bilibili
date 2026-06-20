@@ -1,0 +1,5 @@
+git+https://github.com/Nemo2011/bilibili-api.git@dev
+google-api-python-client
+requests
+fastapi
+uvicorn

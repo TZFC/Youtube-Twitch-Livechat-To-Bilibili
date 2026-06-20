@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat Bridge Controller</title>
+    <style>
+        :root {
+            --bg-color: #f8f9fa;
+            --container-bg: #ffffff;
+            --text-color: #202124;
+            --border-color: #dadce0;
+            --input-bg: #f1f3f4;
+            --btn-green: #1e8e3e;
+            --btn-red: #d93025;
+            --btn-disabled: #f1f3f4;
+            --btn-disabled-text: #80868b;
+        }
+
+        body {
+            font-family: 'Roboto', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+        }
+
+        .container {
+            background-color: var(--container-bg);
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+            padding: 24px;
+            max-width: 600px;
+            width: 100%;
+        }
+
+        h2 {
+            margin-top: 0;
+            font-size: 20px;
+            font-weight: 500;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+
+        .section-title {
+            font-size: 16px;
+            font-weight: 500;
+            margin-top: 24px;
+            margin-bottom: 12px;
+            color: #5f6368;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            font-size: 14px;
+            margin-bottom: 6px;
+            font-weight: 500;
+        }
+
+        .form-group input {
+            padding: 10px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            background-color: var(--input-bg);
+            font-size: 14px;
+            color: var(--text-color);
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: #1a73e8;
+            background-color: #fff;
+        }
+
+        .controls {
+            display: flex;
+            gap: 16px;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+            position: sticky;
+            bottom: 0;
+            background: var(--container-bg);
+        }
+
+        button {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            color: white;
+            transition: background-color 0.2s, opacity 0.2s;
+        }
+
+        button:active {
+            opacity: 0.8;
+        }
+
+        #startBtn {
+            background-color: var(--btn-green);
+        }
+
+        #stopBtn {
+            background-color: var(--btn-red);
+        }
+
+        button:disabled {
+            background-color: var(--btn-disabled) !important;
+            color: var(--btn-disabled-text) !important;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+
+        .live-update-group {
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+
+        .live-update-group button {
+            flex: 0 0 auto;
+            padding: 10px 16px;
+            background-color: #1a73e8;
+            font-size: 14px;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 16px;
+            }
+            .live-update-group {
+                flex-direction: column;
+                align-items: stretch;
+            }
+        }
+        
+        .status {
+            text-align: center;
+            font-size: 14px;
+            margin-top: 10px;
+            font-weight: 500;
+        }
+        .status.running { color: var(--btn-green); }
+        .status.stopped { color: #5f6368; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Chat Bridge Settings</h2>
+
+    <form id="configForm">
+        <div class="section-title">Bilibili Credentials</div>
+        <div class="form-group">
+            <label>SESSDATA</label>
+            <input type="text" name="SESSDATA" id="SESSDATA">
+        </div>
+        <div class="form-group">
+            <label>BILI_JCT</label>
+            <input type="text" name="BILI_JCT" id="BILI_JCT">
+        </div>
+        <div class="form-group">
+            <label>BUVID3</label>
+            <input type="text" name="BUVID3" id="BUVID3">
+        </div>
+        <div class="form-group">
+            <label>DEDEUSERID</label>
+            <input type="text" name="DEDEUSERID" id="DEDEUSERID">
+        </div>
+        <div class="form-group">
+            <label>BILIBILI_ROOM_ID</label>
+            <input type="number" name="BILIBILI_ROOM_ID" id="BILIBILI_ROOM_ID">
+        </div>
+
+        <div class="section-title">Source Platforms</div>
+        <div class="form-group">
+            <label>YOUTUBE_CHANNEL_HANDLE</label>
+            <input type="text" name="YOUTUBE_CHANNEL_HANDLE" id="YOUTUBE_CHANNEL_HANDLE">
+        </div>
+        <div class="form-group">
+            <label>TWITCH_CHANNEL</label>
+            <input type="text" name="TWITCH_CHANNEL" id="TWITCH_CHANNEL">
+        </div>
+
+        <div class="section-title">YouTube API</div>
+        <div class="form-group">
+            <label>YOUTUBE_API_KEY</label>
+            <input type="text" name="YOUTUBE_API_KEY" id="YOUTUBE_API_KEY">
+        </div>
+
+        <div class="section-title">YouTube Quota Optimization Macros (Live Updatable)</div>
+        <div class="form-group">
+            <label>YOUTUBE_POLL_BASE_DELAY_SECONDS</label>
+            <input type="number" step="0.1" name="YOUTUBE_POLL_BASE_DELAY_SECONDS" id="YOUTUBE_POLL_BASE_DELAY_SECONDS">
+        </div>
+        <div class="form-group">
+            <label>YOUTUBE_POLL_MULTIPLIER</label>
+            <input type="number" step="0.1" name="YOUTUBE_POLL_MULTIPLIER" id="YOUTUBE_POLL_MULTIPLIER">
+        </div>
+        <div class="live-update-group">
+            <div class="form-group" style="flex:1; margin-bottom:0;">
+                <label>YOUTUBE_MAX_POLL_DELAY_SECONDS</label>
+                <input type="number" step="0.1" name="YOUTUBE_MAX_POLL_DELAY_SECONDS" id="YOUTUBE_MAX_POLL_DELAY_SECONDS">
+            </div>
+            <button type="button" id="updateBackoffBtn" disabled>Apply Backoff Changes</button>
+        </div>
+    </form>
+
+    <div class="controls">
+        <button id="startBtn">START</button>
+        <button id="stopBtn" disabled>STOP</button>
+    </div>
+    <div id="statusText" class="status stopped">Status: Stopped</div>
+</div>
+
+<script>
+    const form = document.getElementById('configForm');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const updateBackoffBtn = document.getElementById('updateBackoffBtn');
+    const statusText = document.getElementById('statusText');
+
+    // Load initial config
+    async function loadConfig() {
+        try {
+            const res = await fetch('/api/config');
+            const config = await res.json();
+            for (const key in config) {
+                if (form.elements[key]) {
+                    form.elements[key].value = config[key];
+                }
+            }
+        } catch (e) {
+            console.error("Failed to load config", e);
+        }
+    }
+
+    async function checkStatus() {
+        try {
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            updateUIState(data.running);
+        } catch (e) {
+            console.error("Failed to fetch status", e);
+        }
+    }
+
+    function updateUIState(isRunning) {
+        if (isRunning) {
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+            updateBackoffBtn.disabled = false;
+            statusText.textContent = "Status: Running";
+            statusText.className = "status running";
+        } else {
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            updateBackoffBtn.disabled = true;
+            statusText.textContent = "Status: Stopped";
+            statusText.className = "status stopped";
+        }
+    }
+
+    // Save config and start
+    startBtn.addEventListener('click', async () => {
+        startBtn.disabled = true;
+        const formData = new FormData(form);
+        const configData = Object.fromEntries(formData.entries());
+        
+        try {
+            await fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(configData)
+            });
+
+            const res = await fetch('/api/start', { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'started') {
+                updateUIState(true);
+            } else {
+                alert("Error starting: " + data.message);
+                updateUIState(false);
+            }
+        } catch (e) {
+            console.error(e);
+            updateUIState(false);
+        }
+    });
+
+    stopBtn.addEventListener('click', async () => {
+        stopBtn.disabled = true;
+        try {
+            await fetch('/api/stop', { method: 'POST' });
+            updateUIState(false);
+        } catch (e) {
+            console.error(e);
+            updateUIState(true); // revert if failed
+        }
+    });
+
+    updateBackoffBtn.addEventListener('click', async () => {
+        const formData = new FormData(form);
+        const updateData = {
+            YOUTUBE_POLL_BASE_DELAY_SECONDS: formData.get('YOUTUBE_POLL_BASE_DELAY_SECONDS'),
+            YOUTUBE_POLL_MULTIPLIER: formData.get('YOUTUBE_POLL_MULTIPLIER'),
+            YOUTUBE_MAX_POLL_DELAY_SECONDS: formData.get('YOUTUBE_MAX_POLL_DELAY_SECONDS')
+        };
+        try {
+            await fetch('/api/update_backoff', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(updateData)
+            });
+            alert("Backoff settings updated successfully.");
+        } catch (e) {
+            console.error(e);
+            alert("Failed to update backoff settings.");
+        }
+    });
+
+    // Handle tab close (graceful shutdown)
+    window.addEventListener('beforeunload', () => {
+        navigator.sendBeacon('/api/shutdown');
+    });
+
+    // Init
+    loadConfig().then(checkStatus);
+    
+    // Periodically check status in case it stopped due to error
+    setInterval(checkStatus, 5000);
+</script>
+
+</body>
+</html>
