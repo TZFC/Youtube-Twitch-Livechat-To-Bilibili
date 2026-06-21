@@ -82,6 +82,35 @@
             background-color: #fff;
         }
 
+        .password-container {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+
+        .password-container input {
+            width: 100%;
+            padding-right: 40px;
+            box-sizing: border-box;
+        }
+
+        .toggle-password {
+            position: absolute;
+            right: 10px;
+            cursor: pointer;
+            color: #5f6368;
+            user-select: none;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+        }
+
+        .toggle-password:hover {
+            color: #202124;
+        }
+
         .controls {
             display: flex;
             gap: 16px;
@@ -166,15 +195,24 @@
         <div class="section-title">Bilibili Credentials</div>
         <div class="form-group">
             <label>SESSDATA</label>
-            <input type="text" name="SESSDATA" id="SESSDATA">
+            <div class="password-container">
+                <input type="password" name="SESSDATA" id="SESSDATA">
+                <span class="toggle-password" onclick="togglePassword('SESSDATA', this)">👁️</span>
+            </div>
         </div>
         <div class="form-group">
             <label>BILI_JCT</label>
-            <input type="text" name="BILI_JCT" id="BILI_JCT">
+            <div class="password-container">
+                <input type="password" name="BILI_JCT" id="BILI_JCT">
+                <span class="toggle-password" onclick="togglePassword('BILI_JCT', this)">👁️</span>
+            </div>
         </div>
         <div class="form-group">
             <label>BUVID3</label>
-            <input type="text" name="BUVID3" id="BUVID3">
+            <div class="password-container">
+                <input type="password" name="BUVID3" id="BUVID3">
+                <span class="toggle-password" onclick="togglePassword('BUVID3', this)">👁️</span>
+            </div>
         </div>
         <div class="form-group">
             <label>DEDEUSERID</label>
@@ -198,7 +236,10 @@
         <div class="section-title">YouTube API</div>
         <div class="form-group">
             <label>YOUTUBE_API_KEY</label>
-            <input type="text" name="YOUTUBE_API_KEY" id="YOUTUBE_API_KEY">
+            <div class="password-container">
+                <input type="password" name="YOUTUBE_API_KEY" id="YOUTUBE_API_KEY">
+                <span class="toggle-password" onclick="togglePassword('YOUTUBE_API_KEY', this)">👁️</span>
+            </div>
         </div>
 
         <div class="section-title">YouTube Quota Optimization Macros (Live Updatable)</div>
@@ -271,6 +312,17 @@
     const stopBtn = document.getElementById('stopBtn');
     const updateBackoffBtn = document.getElementById('updateBackoffBtn');
     const statusText = document.getElementById('statusText');
+
+    function togglePassword(inputId, iconElement) {
+        const input = document.getElementById(inputId);
+        if (input.type === "password") {
+            input.type = "text";
+            iconElement.textContent = "🙈"; // Hide icon
+        } else {
+            input.type = "password";
+            iconElement.textContent = "👁️"; // Show icon
+        }
+    }
 
     // Load initial config
     async function loadConfig() {
