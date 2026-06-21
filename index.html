@@ -224,7 +224,46 @@
         <button id="stopBtn" disabled>STOP</button>
     </div>
     <div id="statusText" class="status stopped">Status: Stopped</div>
+    
+    <details class="log-section">
+        <summary>Debug Logs</summary>
+        <div class="log-container">
+            <pre id="logOutput"></pre>
+        </div>
+    </details>
 </div>
+
+<style>
+    .log-section {
+        margin-top: 20px;
+        border: 1px solid var(--border-color);
+        border-radius: 4px;
+        background-color: var(--bg-color);
+    }
+    .log-section summary {
+        padding: 10px;
+        font-weight: 500;
+        cursor: pointer;
+        user-select: none;
+        outline: none;
+        color: #5f6368;
+    }
+    .log-container {
+        padding: 10px;
+        border-top: 1px solid var(--border-color);
+        background-color: #1e1e1e;
+        color: #d4d4d4;
+        max-height: 200px;
+        overflow-y: auto;
+    }
+    .log-container pre {
+        margin: 0;
+        font-size: 13px;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        font-family: Consolas, "Courier New", monospace;
+    }
+</style>
 
 <script>
     const form = document.getElementById('configForm');
@@ -337,11 +376,33 @@
         navigator.sendBeacon('/api/shutdown');
     });
 
+    async function updateLogs() {
+        try {
+            const res = await fetch('/api/logs');
+            const data = await res.json();
+            const logOutput = document.getElementById('logOutput');
+            
+            if (logOutput.textContent !== data.logs) {
+                const isScrolledToBottom = logOutput.scrollHeight - logOutput.clientHeight <= logOutput.scrollTop + 5;
+                logOutput.textContent = data.logs || "No logs available.";
+                if (isScrolledToBottom) {
+                    logOutput.scrollTop = logOutput.scrollHeight;
+                }
+            }
+        } catch (e) {
+            console.error("Failed to fetch logs", e);
+        }
+    }
+
     // Init
     loadConfig().then(checkStatus);
+    updateLogs();
     
     // Periodically check status in case it stopped due to error
-    setInterval(checkStatus, 5000);
+    setInterval(() => {
+        checkStatus();
+        updateLogs();
+    }, 2000);
 </script>
 
 </body>

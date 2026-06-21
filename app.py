@@ -8,6 +8,7 @@ import urllib.parse
 import json
 import os
 import sys
+import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
@@ -53,6 +54,16 @@ def save_config():
         json.dump(config, f, indent=4)
 
 load_config()
+
+def add_log(msg: str):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"[{timestamp}] {msg}"
+    print(log_line)
+    try:
+        with open("log.txt", "a", encoding="utf-8") as f:
+            f.write(log_line + "\n")
+    except Exception:
+        pass
 
 # Global state
 shutdown_event = None
@@ -252,18 +263,22 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
             current_live_video_id = get_current_live_video_id_from_youtube_channel_handle(channel_handle_string)
 
             if not current_live_video_id:
+                add_log("Could not find active YouTube live video for handle. Retrying...")
                 await wait_until_timeout_or_shutdown_event(60.0)
                 continue
 
             active_live_chat_id = get_active_live_chat_id_from_youtube_video_id(current_live_video_id)
+            add_log(f"Found active YouTube live chat ID: {active_live_chat_id}")
             break
 
         except HttpError as http_error_exception:
             if check_if_error_is_youtube_quota_exhaustion(http_error_exception):
-                print("\n*** YouTube API Quota exhausted! Shutting down YouTube listener. Twitch-to-Bilibili bridge remains 100% active. ***\n")
+                add_log("*** YouTube API Quota exhausted! Shutting down YouTube listener. Twitch-to-Bilibili bridge remains 100% active. ***")
                 return
+            add_log(f"YouTube HTTP Error fetching chat ID: {http_error_exception}")
             await wait_until_timeout_or_shutdown_event(60.0)
-        except Exception:
+        except Exception as e:
+            add_log(f"YouTube fetch chat ID error: {e}")
             await wait_until_timeout_or_shutdown_event(10.0)
 
     if shutdown_event.is_set():
@@ -297,6 +312,7 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
                     break
 
             if has_live_stream_ended:
+                add_log("YouTube stream ended event received. Shutting down bridge.")
                 shutdown_event.set()
                 break
 
@@ -364,11 +380,13 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
 
         except HttpError as http_error_exception:
             if check_if_error_is_youtube_quota_exhaustion(http_error_exception):
-                print("\n*** YouTube API Quota exhausted! Shutting down YouTube listener. Twitch-to-Bilibili bridge remains 100% active. ***\n")
+                add_log("*** YouTube API Quota exhausted! Shutting down YouTube listener. Twitch-to-Bilibili bridge remains 100% active. ***")
                 return
+            add_log(f"YouTube HTTP Error polling chat: {http_error_exception}")
             await wait_until_timeout_or_shutdown_event(5.0)
 
-        except Exception:
+        except Exception as e:
+            add_log(f"YouTube poll chat error: {e}")
             await wait_until_timeout_or_shutdown_event(5.0)
 
 async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Queue):
@@ -445,7 +463,8 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                 if not chat_message_queue.full():
                     await chat_message_queue.put(("[TW]", formatted_final_message))
 
-        except Exception:
+        except Exception as e:
+            add_log(f"Twitch listener error: {e}")
             await wait_until_timeout_or_shutdown_event(3.0)
 
         finally:
@@ -467,7 +486,8 @@ async def send_queued_messages_to_bilibili_live_room(chat_message_queue: asyncio
             if bilibili_live_room:
                 await bilibili_live_room.send_danmaku(Danmaku(chat_message_content))
             await asyncio.sleep(1.0)
-        except Exception:
+        except Exception as e:
+            add_log(f"Bilibili send error: {e}")
             await asyncio.sleep(1.0)
         finally:
             chat_message_queue.task_done()
@@ -495,6 +515,18 @@ def get_ui():
 @app.get("/favicon.ico")
 def get_favicon():
     return FileResponse("favicon.ico")
+
+@app.get("/api/logs")
+def api_get_logs():
+    if not os.path.exists("log.txt"):
+        return {"logs": ""}
+    try:
+        with open("log.txt", "r", encoding="utf-8") as f:
+            # Return last 100 lines
+            lines = f.readlines()
+            return {"logs": "".join(lines[-100:])}
+    except Exception:
+        return {"logs": ""}
 
 @app.get("/api/config")
 def api_get_config():
@@ -552,8 +584,10 @@ async def api_start():
         else:
             youtube_api_client = None
     except Exception as e:
+        add_log(f"Error starting bridge: {e}")
         return {"status": "error", "message": str(e)}
 
+    add_log("Starting bridge tasks...")
     bridge_task = asyncio.create_task(run_youtube_and_twitch_to_bilibili_chat_bridge())
     return {"status": "started"}
 
@@ -563,8 +597,10 @@ async def api_stop():
     if shutdown_event:
         shutdown_event.set()
     if bridge_task:
+        add_log("Stopping bridge tasks...")
         await bridge_task
         bridge_task = None
+        add_log("Bridge tasks stopped.")
     return {"status": "stopped"}
 
 @app.post("/api/shutdown")
