@@ -42,6 +42,12 @@ echo ========================================================
 
 echo.
 echo ========================================================
+echo Compiling Protocol Buffers...
+echo ========================================================
+"%PYTHON_EXE%" -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. stream_list.proto
+
+echo.
+echo ========================================================
 echo Starting Application...
 echo ========================================================
 start http://127.0.0.1:8000

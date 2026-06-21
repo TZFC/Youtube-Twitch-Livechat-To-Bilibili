@@ -9,10 +9,14 @@ import json
 import os
 import sys
 import datetime
+import grpc
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
 import uvicorn
+
+import stream_list_pb2
+import stream_list_pb2_grpc
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -31,10 +35,7 @@ default_config = {
     "BILIBILI_ROOM_ID": 23596840,
     "YOUTUBE_CHANNEL_HANDLE": "@沐晓空",
     "TWITCH_CHANNEL": "muxiaokong",
-    "YOUTUBE_API_KEY": "",
-    "YOUTUBE_POLL_BASE_DELAY_SECONDS": 2.0,
-    "YOUTUBE_POLL_MULTIPLIER": 2.0,
-    "YOUTUBE_MAX_POLL_DELAY_SECONDS": 30.0
+    "YOUTUBE_API_KEY": ""
 }
 
 config = default_config.copy()
@@ -229,39 +230,6 @@ def get_active_live_chat_id_from_youtube_video_id(video_id):
 
     return active_live_chat_id_string
 
-def check_if_error_is_youtube_quota_exhaustion(caught_error_exception):
-    if not isinstance(caught_error_exception, HttpError):
-        return False
-
-    if getattr(caught_error_exception, "status_code", None) != 403 and getattr(getattr(caught_error_exception, "resp", None), "status", None) != 403:
-        return False
-
-    try:
-        error_payload_details = caught_error_exception.error_details
-    except Exception:
-        error_payload_details = None
-
-    error_reason_strings_list = []
-    if isinstance(error_payload_details, list):
-        for error_item_dictionary in error_payload_details:
-            if isinstance(error_item_dictionary, dict):
-                error_reason_value = error_item_dictionary.get("reason")
-                error_message_value = error_item_dictionary.get("message")
-                if error_reason_value:
-                    error_reason_strings_list.append(str(error_reason_value))
-                if error_message_value:
-                    error_reason_strings_list.append(str(error_message_value))
-
-    combined_error_text_lowercase = " ".join(error_reason_strings_list).lower()
-    combined_error_text_lowercase += " " + str(caught_error_exception).lower()
-
-    quota_exhaustion_marker_strings = [
-        "quotaexceeded", "dailylimitexceeded", "ratelimitexceeded",
-        "usagerateexceeded", "quota", "daily limit exceeded", "rate limit exceeded",
-    ]
-
-    return any(marker_string in combined_error_text_lowercase for marker_string in quota_exhaustion_marker_strings)
-
 async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.Queue, channel_handle_string: str):
     current_live_video_id = None
     active_live_chat_id = None
@@ -271,21 +239,18 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
 
     while not shutdown_event.is_set():
         try:
-            current_live_video_id = get_current_live_video_id_from_youtube_channel_handle(channel_handle_string)
+            current_live_video_id = await asyncio.to_thread(get_current_live_video_id_from_youtube_channel_handle, channel_handle_string)
 
             if not current_live_video_id:
                 add_log("Could not find active YouTube live video for handle. Retrying...")
                 await wait_until_timeout_or_shutdown_event(60.0)
                 continue
 
-            active_live_chat_id = get_active_live_chat_id_from_youtube_video_id(current_live_video_id)
+            active_live_chat_id = await asyncio.to_thread(get_active_live_chat_id_from_youtube_video_id, current_live_video_id)
             add_log(f"Found active YouTube live chat ID: {active_live_chat_id}")
             break
 
         except HttpError as http_error_exception:
-            if check_if_error_is_youtube_quota_exhaustion(http_error_exception):
-                add_log("*** YouTube API Quota exhausted! Shutting down YouTube listener. Twitch-to-Bilibili bridge remains 100% active. ***")
-                return
             add_log(f"YouTube HTTP Error fetching chat ID: {http_error_exception}")
             await wait_until_timeout_or_shutdown_event(60.0)
         except Exception as e:
@@ -295,137 +260,93 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
     if shutdown_event.is_set():
         return
 
-    previously_seen_message_ids_set = set()
-    previously_seen_message_ids_queue = collections.deque(maxlen=2000)
+    api_key = config.get("YOUTUBE_API_KEY")
+    if not api_key:
+        add_log("YouTube API key is missing. Cannot start gRPC stream.")
+        return
 
-    youtube_api_next_page_token = None
-    is_initial_chat_poll = True
-    
-    current_exponential_backoff_delay = float(config.get("YOUTUBE_POLL_BASE_DELAY_SECONDS", 2.0))
+    def run_grpc_stream():
+        creds = grpc.ssl_channel_credentials()
+        with grpc.secure_channel("dns:///youtube.googleapis.com:443", creds) as channel:
+            stub = stream_list_pb2_grpc.V3DataLiveChatMessageServiceStub(channel)
+            metadata = (("x-goog-api-key", api_key),)
+            next_page_token = None
+            
+            while not shutdown_event.is_set():
+                request = stream_list_pb2.LiveChatMessageListRequest(
+                    part=["id", "snippet", "authorDetails"],
+                    live_chat_id=active_live_chat_id,
+                    max_results=200,
+                    page_token=next_page_token,
+                )
+                
+                try:
+                    for response in stub.StreamList(request, metadata=metadata):
+                        if shutdown_event.is_set():
+                            break
+                            
+                        has_live_stream_ended = False
+                        for item in response.items:
+                            event_type = item.snippet.type
+                            
+                            # Protobuf enums: CHAT_ENDED_EVENT is 4
+                            if event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.CHAT_ENDED_EVENT:
+                                has_live_stream_ended = True
+                                break
+                                
+                            author_display_name = item.author_details.display_name if item.HasField("author_details") else "unknown"
+                            
+                            if event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.TEXT_MESSAGE_EVENT:
+                                if item.snippet.HasField("text_message_details"):
+                                    raw_text = item.snippet.text_message_details.message_text
+                                elif item.snippet.HasField("display_message"):
+                                    raw_text = item.snippet.display_message
+                                else:
+                                    continue
+                                    
+                                cleaned_chat = clean_whitespace_and_youtube_emotes_from_message(raw_text)
+                                if is_text_empty_or_only_punctuation(cleaned_chat):
+                                    continue
+                                formatted_msg = format_message_with_username_and_truncate(cleaned_chat, author_display_name, "@")
+                                # Push to queue in thread-safe manner
+                                asyncio.run_coroutine_threadsafe(chat_message_queue.put(("[YT]", formatted_msg)), asyncio.get_running_loop())
+                                
+                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_CHAT_EVENT:
+                                if item.snippet.HasField("super_chat_details"):
+                                    details = item.snippet.super_chat_details
+                                    amount = details.amount_display_string if details.HasField("amount_display_string") else ""
+                                    comment = details.user_comment if details.HasField("user_comment") else ""
+                                    msg = f"{comment} {amount}".strip()
+                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                    asyncio.run_coroutine_threadsafe(chat_message_queue.put(("[YT]", formatted_msg)), asyncio.get_running_loop())
+                                    
+                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_STICKER_EVENT:
+                                if item.snippet.HasField("super_sticker_details"):
+                                    details = item.snippet.super_sticker_details
+                                    amount = details.amount_display_string if details.HasField("amount_display_string") else ""
+                                    msg = f"Super Sticker {amount}".strip()
+                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                    asyncio.run_coroutine_threadsafe(chat_message_queue.put(("[YT]", formatted_msg)), asyncio.get_running_loop())
+                                    
+                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.NEW_SPONSOR_EVENT:
+                                msg = "New Membership!"
+                                formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                asyncio.run_coroutine_threadsafe(chat_message_queue.put(("[YT]", formatted_msg)), asyncio.get_running_loop())
 
-    while not shutdown_event.is_set():
-        try:
-            youtube_api_chat_response = youtube_api_client.liveChatMessages().list(
-                liveChatId=active_live_chat_id,
-                part="id,snippet,authorDetails",
-                pageToken=youtube_api_next_page_token,
-                maxResults=200,
-            ).execute()
+                        if has_live_stream_ended:
+                            add_log("YouTube stream ended event received. Shutting down bridge.")
+                            shutdown_event.set()
+                            break
 
-            current_chat_items_list = youtube_api_chat_response.get("items", [])
-            youtube_api_next_page_token = youtube_api_chat_response.get("nextPageToken")
-            youtube_api_polling_interval_milliseconds = youtube_api_chat_response.get("pollingIntervalMillis", 3000)
-
-            has_live_stream_ended = False
-            for chat_item_dictionary in current_chat_items_list:
-                if chat_item_dictionary.get("snippet", {}).get("type") == "liveChatEndedEvent":
-                    has_live_stream_ended = True
+                        next_page_token = response.next_page_token
+                        if not next_page_token:
+                            break
+                            
+                except grpc.RpcError as e:
+                    add_log(f"gRPC stream error: {e}")
                     break
 
-            if has_live_stream_ended:
-                add_log("YouTube stream ended event received. Shutting down bridge.")
-                shutdown_event.set()
-                break
-
-            if is_initial_chat_poll:
-                for chat_item_dictionary in current_chat_items_list:
-                    message_id_string = chat_item_dictionary.get("id")
-                    if message_id_string and message_id_string not in previously_seen_message_ids_set:
-                        previously_seen_message_ids_queue.append(message_id_string)
-                        previously_seen_message_ids_set.add(message_id_string)
-
-                is_initial_chat_poll = False
-                await wait_until_timeout_or_shutdown_event(youtube_api_polling_interval_milliseconds / 1000.0)
-                continue
-
-            processed_new_messages_count = 0
-
-            for chat_item_dictionary in current_chat_items_list:
-                message_id_string = chat_item_dictionary.get("id")
-                if not message_id_string or message_id_string in previously_seen_message_ids_set:
-                    continue
-
-                if len(previously_seen_message_ids_queue) == 2000:
-                    oldest_tracked_message_id = previously_seen_message_ids_queue.popleft()
-                    previously_seen_message_ids_set.discard(oldest_tracked_message_id)
-
-                previously_seen_message_ids_queue.append(message_id_string)
-                previously_seen_message_ids_set.add(message_id_string)
-
-                chat_snippet_dictionary = chat_item_dictionary.get("snippet", {})
-                chat_author_details_dictionary = chat_item_dictionary.get("authorDetails", {})
-
-                author_display_name_string = chat_author_details_dictionary.get("displayName", "unknown")
-                event_type = chat_snippet_dictionary.get("type")
-
-                if event_type == "textMessageEvent":
-                    text_message_details_dictionary = chat_snippet_dictionary.get("textMessageDetails", {})
-                    raw_message_text_string = text_message_details_dictionary.get("messageText", "").strip()
-
-                    if not raw_message_text_string:
-                        raw_message_text_string = chat_snippet_dictionary.get("displayMessage", "").strip()
-
-                    cleaned_chat_message = clean_whitespace_and_youtube_emotes_from_message(raw_message_text_string)
-                    if is_text_empty_or_only_punctuation(cleaned_chat_message):
-                        continue
-
-                    formatted_final_message = format_message_with_username_and_truncate(cleaned_chat_message, author_display_name_string, "@")
-                    if not chat_message_queue.full():
-                        await chat_message_queue.put(("[YT]", formatted_final_message))
-                        processed_new_messages_count += 1
-
-                elif event_type == "superChatEvent":
-                    super_chat_details = chat_snippet_dictionary.get("superChatDetails", {})
-                    amount_display = super_chat_details.get("amountDisplayString", "")
-                    user_comment = super_chat_details.get("userComment", "")
-                    
-                    message_content = f"{user_comment} {amount_display}".strip()
-                    formatted_final_message = format_message_with_username_and_truncate(message_content, author_display_name_string, "@")
-                    if not chat_message_queue.full():
-                        await chat_message_queue.put(("[YT]", formatted_final_message))
-                        processed_new_messages_count += 1
-
-                elif event_type == "superStickerEvent":
-                    super_sticker_details = chat_snippet_dictionary.get("superStickerDetails", {})
-                    amount_display = super_sticker_details.get("amountDisplayString", "")
-                    
-                    message_content = f"Super Sticker {amount_display}".strip()
-                    formatted_final_message = format_message_with_username_and_truncate(message_content, author_display_name_string, "@")
-                    if not chat_message_queue.full():
-                        await chat_message_queue.put(("[YT]", formatted_final_message))
-                        processed_new_messages_count += 1
-
-                elif event_type == "newSponsorEvent":
-                    message_content = "New Membership!"
-                    formatted_final_message = format_message_with_username_and_truncate(message_content, author_display_name_string, "@")
-                    if not chat_message_queue.full():
-                        await chat_message_queue.put(("[YT]", formatted_final_message))
-                        processed_new_messages_count += 1
-
-            base_delay = float(config.get("YOUTUBE_POLL_BASE_DELAY_SECONDS", 2.0))
-            multiplier = float(config.get("YOUTUBE_POLL_MULTIPLIER", 2.0))
-            max_delay = float(config.get("YOUTUBE_MAX_POLL_DELAY_SECONDS", 30.0))
-
-            if processed_new_messages_count > 0:
-                current_exponential_backoff_delay = base_delay
-            else:
-                current_exponential_backoff_delay = min(current_exponential_backoff_delay * multiplier, max_delay)
-
-            mandatory_api_sleep_minimum_seconds = youtube_api_polling_interval_milliseconds / 1000.0
-            optimized_sleep_duration_seconds = max(mandatory_api_sleep_minimum_seconds, current_exponential_backoff_delay)
-
-            await wait_until_timeout_or_shutdown_event(optimized_sleep_duration_seconds)
-
-        except HttpError as http_error_exception:
-            if check_if_error_is_youtube_quota_exhaustion(http_error_exception):
-                add_log("*** YouTube API Quota exhausted! Shutting down YouTube listener. Twitch-to-Bilibili bridge remains 100% active. ***")
-                return
-            add_log(f"YouTube HTTP Error polling chat: {http_error_exception}")
-            await wait_until_timeout_or_shutdown_event(5.0)
-
-        except Exception as e:
-            add_log(f"YouTube poll chat error: {e}")
-            await wait_until_timeout_or_shutdown_event(5.0)
+    await asyncio.to_thread(run_grpc_stream)
 
 async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Queue):
     twitch_irc_server_address = "irc.chat.twitch.tv"
@@ -598,19 +519,6 @@ async def api_save_config(request: Request):
     global config
     new_config = await request.json()
     config.update(new_config)
-    save_config()
-    return {"status": "ok"}
-
-@app.post("/api/update_backoff")
-async def api_update_backoff(request: Request):
-    global config
-    new_config = await request.json()
-    if "YOUTUBE_POLL_BASE_DELAY_SECONDS" in new_config:
-        config["YOUTUBE_POLL_BASE_DELAY_SECONDS"] = float(new_config["YOUTUBE_POLL_BASE_DELAY_SECONDS"])
-    if "YOUTUBE_POLL_MULTIPLIER" in new_config:
-        config["YOUTUBE_POLL_MULTIPLIER"] = float(new_config["YOUTUBE_POLL_MULTIPLIER"])
-    if "YOUTUBE_MAX_POLL_DELAY_SECONDS" in new_config:
-        config["YOUTUBE_MAX_POLL_DELAY_SECONDS"] = float(new_config["YOUTUBE_MAX_POLL_DELAY_SECONDS"])
     save_config()
     return {"status": "ok"}
 

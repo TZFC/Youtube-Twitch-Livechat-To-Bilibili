@@ -3,4 +3,6 @@ google-api-python-client
 requests
 fastapi
 uvicorn
+grpcio
+grpcio-tools
 curl_cffi
