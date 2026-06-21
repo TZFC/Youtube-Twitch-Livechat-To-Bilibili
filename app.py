@@ -11,6 +11,8 @@ import sys
 import datetime
 import grpc
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
 import uvicorn
