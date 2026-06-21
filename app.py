@@ -73,8 +73,19 @@ bilibili_live_room = None
 youtube_api_client = None
 
 twitch_privmsg_pattern = re.compile(r"^(?:@([^\s]+)\s+)?:(\w+)!.*?PRIVMSG.*? :(.*)$")
+twitch_usernotice_pattern = re.compile(r"^(?:@([^\s]+)\s+)?:tmi\.twitch\.tv\s+USERNOTICE\s+#[^\s]+(?:\s+:(.*))?$")
 youtube_colon_emote_pattern = re.compile(r":[^:\s]{1,64}:")
 youtube_bracket_emote_pattern = re.compile(r"\[[^\[\]\n]{1,64}\]")
+
+def parse_twitch_tags(tags_string):
+    tags = {}
+    if not tags_string:
+        return tags
+    for tag in tags_string.split(";"):
+        if "=" in tag:
+            k, v = tag.split("=", 1)
+            tags[k] = v
+    return tags
 
 async def wait_until_timeout_or_shutdown_event(timeout_duration_seconds):
     try:
@@ -344,25 +355,52 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
                 chat_snippet_dictionary = chat_item_dictionary.get("snippet", {})
                 chat_author_details_dictionary = chat_item_dictionary.get("authorDetails", {})
 
-                if chat_snippet_dictionary.get("type") != "textMessageEvent":
-                    continue
-
-                text_message_details_dictionary = chat_snippet_dictionary.get("textMessageDetails", {})
-                raw_message_text_string = text_message_details_dictionary.get("messageText", "").strip()
-
-                if not raw_message_text_string:
-                    raw_message_text_string = chat_snippet_dictionary.get("displayMessage", "").strip()
-
                 author_display_name_string = chat_author_details_dictionary.get("displayName", "unknown")
+                event_type = chat_snippet_dictionary.get("type")
 
-                cleaned_chat_message = clean_whitespace_and_youtube_emotes_from_message(raw_message_text_string)
-                if is_text_empty_or_only_punctuation(cleaned_chat_message):
-                    continue
+                if event_type == "textMessageEvent":
+                    text_message_details_dictionary = chat_snippet_dictionary.get("textMessageDetails", {})
+                    raw_message_text_string = text_message_details_dictionary.get("messageText", "").strip()
 
-                formatted_final_message = format_message_with_username_and_truncate(cleaned_chat_message, author_display_name_string, "@")
-                if not chat_message_queue.full():
-                    await chat_message_queue.put(("[YT]", formatted_final_message))
-                    processed_new_messages_count += 1
+                    if not raw_message_text_string:
+                        raw_message_text_string = chat_snippet_dictionary.get("displayMessage", "").strip()
+
+                    cleaned_chat_message = clean_whitespace_and_youtube_emotes_from_message(raw_message_text_string)
+                    if is_text_empty_or_only_punctuation(cleaned_chat_message):
+                        continue
+
+                    formatted_final_message = format_message_with_username_and_truncate(cleaned_chat_message, author_display_name_string, "@")
+                    if not chat_message_queue.full():
+                        await chat_message_queue.put(("[YT]", formatted_final_message))
+                        processed_new_messages_count += 1
+
+                elif event_type == "superChatEvent":
+                    super_chat_details = chat_snippet_dictionary.get("superChatDetails", {})
+                    amount_display = super_chat_details.get("amountDisplayString", "")
+                    user_comment = super_chat_details.get("userComment", "")
+                    
+                    message_content = f"{user_comment} {amount_display}".strip()
+                    formatted_final_message = format_message_with_username_and_truncate(message_content, author_display_name_string, "@")
+                    if not chat_message_queue.full():
+                        await chat_message_queue.put(("[YT]", formatted_final_message))
+                        processed_new_messages_count += 1
+
+                elif event_type == "superStickerEvent":
+                    super_sticker_details = chat_snippet_dictionary.get("superStickerDetails", {})
+                    amount_display = super_sticker_details.get("amountDisplayString", "")
+                    
+                    message_content = f"Super Sticker {amount_display}".strip()
+                    formatted_final_message = format_message_with_username_and_truncate(message_content, author_display_name_string, "@")
+                    if not chat_message_queue.full():
+                        await chat_message_queue.put(("[YT]", formatted_final_message))
+                        processed_new_messages_count += 1
+
+                elif event_type == "newSponsorEvent":
+                    message_content = "New Membership!"
+                    formatted_final_message = format_message_with_username_and_truncate(message_content, author_display_name_string, "@")
+                    if not chat_message_queue.full():
+                        await chat_message_queue.put(("[YT]", formatted_final_message))
+                        processed_new_messages_count += 1
 
             base_delay = float(config.get("YOUTUBE_POLL_BASE_DELAY_SECONDS", 2.0))
             multiplier = float(config.get("YOUTUBE_POLL_MULTIPLIER", 2.0))
@@ -421,7 +459,7 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                 raise RuntimeError("Could not connect to Twitch IRC on any port")
 
             stream_writer.write(f"NICK {anonymous_twitch_nickname}\r\n".encode("utf-8"))
-            stream_writer.write(b"CAP REQ :twitch.tv/tags\r\n")
+            stream_writer.write(b"CAP REQ :twitch.tv/tags twitch.tv/commands\r\n")
             stream_writer.write(f"JOIN #{twitch_channel.lower()}\r\n".encode("utf-8"))
             await stream_writer.drain()
 
@@ -441,27 +479,46 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                     await stream_writer.drain()
                     continue
 
-                if "PRIVMSG" not in decoded_irc_line:
-                    continue
+                if "PRIVMSG" in decoded_irc_line:
+                    privmsg_regex_match = twitch_privmsg_pattern.match(decoded_irc_line)
+                    if not privmsg_regex_match:
+                        continue
 
-                privmsg_regex_match = twitch_privmsg_pattern.match(decoded_irc_line)
-                if not privmsg_regex_match:
-                    continue
+                    twitch_tags_string = privmsg_regex_match.group(1)
+                    twitch_author_username = privmsg_regex_match.group(2)
+                    raw_chat_message = privmsg_regex_match.group(3)
 
-                twitch_tags_string = privmsg_regex_match.group(1)
-                twitch_author_username = privmsg_regex_match.group(2)
-                raw_chat_message = privmsg_regex_match.group(3)
+                    message_without_twitch_emotes = remove_twitch_emotes_from_message(raw_chat_message, twitch_tags_string)
+                    cleaned_chat_message = clean_whitespace_from_message(message_without_twitch_emotes)
 
-                message_without_twitch_emotes = remove_twitch_emotes_from_message(raw_chat_message, twitch_tags_string)
-                cleaned_chat_message = clean_whitespace_from_message(message_without_twitch_emotes)
+                    tags = parse_twitch_tags(twitch_tags_string)
+                    bits = tags.get("bits", "0")
+                    if bits.isdigit() and int(bits) > 0:
+                        cleaned_chat_message = f"{cleaned_chat_message} {bits} Bits".strip()
 
-                if is_text_empty_or_only_punctuation(cleaned_chat_message):
-                    continue
+                    if is_text_empty_or_only_punctuation(cleaned_chat_message):
+                        continue
 
-                formatted_final_message = format_message_with_username_and_truncate(cleaned_chat_message, twitch_author_username, "#")
+                    formatted_final_message = format_message_with_username_and_truncate(cleaned_chat_message, twitch_author_username, "#")
+                    if not chat_message_queue.full():
+                        await chat_message_queue.put(("[TW]", formatted_final_message))
 
-                if not chat_message_queue.full():
-                    await chat_message_queue.put(("[TW]", formatted_final_message))
+                elif "USERNOTICE" in decoded_irc_line:
+                    usernotice_match = twitch_usernotice_pattern.match(decoded_irc_line)
+                    if usernotice_match:
+                        tags_str = usernotice_match.group(1)
+                        user_msg = usernotice_match.group(2) or ""
+                        tags = parse_twitch_tags(tags_str)
+                        
+                        msg_id = tags.get("msg-id")
+                        display_name = tags.get("display-name") or tags.get("login") or "unknown"
+                        system_msg = tags.get("system-msg", "").replace("\\s", " ")
+                        
+                        if msg_id in ["sub", "resub", "subgift", "anonsubgift", "submysterygift"]:
+                            message_content = f"{system_msg} {user_msg}".strip()
+                            formatted_final_message = format_message_with_username_and_truncate(message_content, display_name, "#")
+                            if not chat_message_queue.full():
+                                await chat_message_queue.put(("[TW]", formatted_final_message))
 
         except Exception as e:
             add_log(f"Twitch listener error: {e}")
