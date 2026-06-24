@@ -37,7 +37,8 @@ default_config = {
     "BILIBILI_ROOM_ID": 23596840,
     "YOUTUBE_CHANNEL_HANDLE": "@沐晓空",
     "TWITCH_CHANNEL": "muxiaokong",
-    "YOUTUBE_API_KEY": ""
+    "YOUTUBE_API_KEY": "",
+    "OUTPUT_LANGUAGE": "en"
 }
 
 config = default_config.copy()
@@ -275,6 +276,10 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
             stub = stream_list_pb2_grpc.V3DataLiveChatMessageServiceStub(channel)
             metadata = (("x-goog-api-key", api_key),)
             next_page_token = None
+            is_initial_chat_poll = True
+            
+            previously_seen_message_ids_set = set()
+            previously_seen_message_ids_queue = collections.deque(maxlen=2000)
             
             def enqueue_msg(tag, msg):
                 try:
@@ -296,8 +301,29 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
                         if shutdown_event.is_set():
                             break
                             
+                        if is_initial_chat_poll:
+                            for item in response.items:
+                                msg_id = item.id
+                                if msg_id and msg_id not in previously_seen_message_ids_set:
+                                    previously_seen_message_ids_queue.append(msg_id)
+                                    previously_seen_message_ids_set.add(msg_id)
+                            is_initial_chat_poll = False
+                            next_page_token = response.next_page_token
+                            continue
+
                         has_live_stream_ended = False
                         for item in response.items:
+                            msg_id = item.id
+                            if not msg_id or msg_id in previously_seen_message_ids_set:
+                                continue
+                                
+                            if len(previously_seen_message_ids_queue) == 2000:
+                                oldest_tracked_message_id = previously_seen_message_ids_queue.popleft()
+                                previously_seen_message_ids_set.discard(oldest_tracked_message_id)
+
+                            previously_seen_message_ids_queue.append(msg_id)
+                            previously_seen_message_ids_set.add(msg_id)
+                            
                             event_type = item.snippet.type
                             
                             # Protobuf enums: CHAT_ENDED_EVENT is 4
@@ -334,12 +360,30 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
                                 if item.snippet.HasField("super_sticker_details"):
                                     details = item.snippet.super_sticker_details
                                     amount = details.amount_display_string if details.HasField("amount_display_string") else ""
-                                    msg = f"Super Sticker {amount}".strip()
+                                    lang = config.get("OUTPUT_LANGUAGE", "en")
+                                    sticker_name = "Super Sticker" if lang == "en" else "超级贴纸"
+                                    msg = f"{sticker_name} {amount}".strip()
                                     formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
                                     enqueue_msg("[YT]", formatted_msg)
                                     
                             elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.NEW_SPONSOR_EVENT:
-                                msg = "New Membership!"
+                                lang = config.get("OUTPUT_LANGUAGE", "en")
+                                msg = "New Membership!" if lang == "en" else "新会员！"
+                                formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                enqueue_msg("[YT]", formatted_msg)
+                                
+                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.MEMBERSHIP_GIFTING_EVENT:
+                                if item.snippet.HasField("membership_gifting_details"):
+                                    details = item.snippet.membership_gifting_details
+                                    count = details.gift_memberships_count if details.HasField("gift_memberships_count") else 1
+                                    lang = config.get("OUTPUT_LANGUAGE", "en")
+                                    msg = f"Gifted {count} Memberships!" if lang == "en" else f"赠送了 {count} 个会员！"
+                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                    enqueue_msg("[YT]", formatted_msg)
+                                    
+                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.GIFT_MEMBERSHIP_RECEIVED_EVENT:
+                                lang = config.get("OUTPUT_LANGUAGE", "en")
+                                msg = "Received a Gift Membership!" if lang == "en" else "收到了赠送的会员！"
                                 formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
                                 enqueue_msg("[YT]", formatted_msg)
 
@@ -425,7 +469,9 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                     tags = parse_twitch_tags(twitch_tags_string)
                     bits = tags.get("bits", "0")
                     if bits.isdigit() and int(bits) > 0:
-                        cleaned_chat_message = f"{cleaned_chat_message} {bits} Bits".strip()
+                        lang = config.get("OUTPUT_LANGUAGE", "en")
+                        bits_text = "Bits" if lang == "en" else "碎晶"
+                        cleaned_chat_message = f"{cleaned_chat_message} {bits} {bits_text}".strip()
 
                     if is_text_empty_or_only_punctuation(cleaned_chat_message):
                         continue
@@ -445,7 +491,7 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                         display_name = tags.get("display-name") or tags.get("login") or "unknown"
                         system_msg = tags.get("system-msg", "").replace("\\s", " ")
                         
-                        if msg_id in ["sub", "resub", "subgift", "anonsubgift", "submysterygift"]:
+                        if system_msg:
                             message_content = f"{system_msg} {user_msg}".strip()
                             formatted_final_message = format_message_with_username_and_truncate(message_content, display_name, "#")
                             if not chat_message_queue.full():

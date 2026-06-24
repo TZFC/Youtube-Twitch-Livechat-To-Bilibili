@@ -111,6 +111,22 @@
             color: #202124;
         }
 
+        .form-group select {
+            padding: 10px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            background-color: var(--input-bg);
+            font-size: 14px;
+            color: var(--text-color);
+            transition: border-color 0.2s;
+        }
+
+        .form-group select:focus {
+            outline: none;
+            border-color: #1a73e8;
+            background-color: #fff;
+        }
+
         .controls {
             display: flex;
             gap: 16px;
@@ -192,6 +208,15 @@
     <h2>Chat Bridge Settings</h2>
 
     <form id="configForm">
+        <div class="section-title">General Settings</div>
+        <div class="form-group">
+            <label>Output Language (Affects translated gift alerts)</label>
+            <select name="OUTPUT_LANGUAGE" id="OUTPUT_LANGUAGE">
+                <option value="en">English</option>
+                <option value="zh">Chinese (中文)</option>
+            </select>
+        </div>
+
         <div class="section-title">Bilibili Credentials</div>
         <div class="form-group">
             <label>SESSDATA</label>
