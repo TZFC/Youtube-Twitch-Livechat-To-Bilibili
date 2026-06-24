@@ -267,6 +267,8 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
         add_log("YouTube API key is missing. Cannot start gRPC stream.")
         return
 
+    main_loop = asyncio.get_running_loop()
+
     def run_grpc_stream():
         creds = grpc.ssl_channel_credentials()
         with grpc.secure_channel("dns:///youtube.googleapis.com:443", creds) as channel:
@@ -274,6 +276,13 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
             metadata = (("x-goog-api-key", api_key),)
             next_page_token = None
             
+            def enqueue_msg(tag, msg):
+                try:
+                    future = asyncio.run_coroutine_threadsafe(chat_message_queue.put((tag, msg)), main_loop)
+                    future.result() # Wait for it to be added to the queue
+                except Exception as e:
+                    add_log(f"Failed to queue YouTube message: {e}")
+
             while not shutdown_event.is_set():
                 request = stream_list_pb2.LiveChatMessageListRequest(
                     part=["id", "snippet", "authorDetails"],
@@ -310,8 +319,7 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
                                 if is_text_empty_or_only_punctuation(cleaned_chat):
                                     continue
                                 formatted_msg = format_message_with_username_and_truncate(cleaned_chat, author_display_name, "@")
-                                # Push to queue in thread-safe manner
-                                asyncio.run_coroutine_threadsafe(chat_message_queue.put(("[YT]", formatted_msg)), asyncio.get_running_loop())
+                                enqueue_msg("[YT]", formatted_msg)
                                 
                             elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_CHAT_EVENT:
                                 if item.snippet.HasField("super_chat_details"):
@@ -320,7 +328,7 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
                                     comment = details.user_comment if details.HasField("user_comment") else ""
                                     msg = f"{comment} {amount}".strip()
                                     formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                    asyncio.run_coroutine_threadsafe(chat_message_queue.put(("[YT]", formatted_msg)), asyncio.get_running_loop())
+                                    enqueue_msg("[YT]", formatted_msg)
                                     
                             elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_STICKER_EVENT:
                                 if item.snippet.HasField("super_sticker_details"):
@@ -328,12 +336,12 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
                                     amount = details.amount_display_string if details.HasField("amount_display_string") else ""
                                     msg = f"Super Sticker {amount}".strip()
                                     formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                    asyncio.run_coroutine_threadsafe(chat_message_queue.put(("[YT]", formatted_msg)), asyncio.get_running_loop())
+                                    enqueue_msg("[YT]", formatted_msg)
                                     
                             elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.NEW_SPONSOR_EVENT:
                                 msg = "New Membership!"
                                 formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                asyncio.run_coroutine_threadsafe(chat_message_queue.put(("[YT]", formatted_msg)), asyncio.get_running_loop())
+                                enqueue_msg("[YT]", formatted_msg)
 
                         if has_live_stream_ended:
                             add_log("YouTube stream ended event received. Shutting down bridge.")
