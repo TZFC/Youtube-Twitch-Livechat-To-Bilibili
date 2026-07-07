@@ -1,4 +1,4 @@
-https://github.com/Nemo2011/bilibili-api/archive/refs/heads/dev.zip
+bilibili-api-python
 google-api-python-client
 requests
 fastapi

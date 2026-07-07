@@ -225,7 +225,10 @@
         </div>
         <div class="form-group">
             <label>Banned Words (Comma-separated)</label>
-            <input type="text" name="BANNED_WORDS" id="BANNED_WORDS" placeholder="e.g. ad, spam，promo">
+            <div class="password-container">
+                <input type="password" name="BANNED_WORDS" id="BANNED_WORDS" placeholder="e.g. ad, spam，promo">
+                <span class="toggle-password" onclick="togglePassword('BANNED_WORDS', this)">👁️</span>
+            </div>
         </div>
 
         <div class="section-title">Bilibili Credentials</div>
