@@ -38,7 +38,9 @@ default_config = {
     "YOUTUBE_CHANNEL_HANDLE": "@沐晓空",
     "TWITCH_CHANNEL": "muxiaokong",
     "YOUTUBE_API_KEY": "",
-    "OUTPUT_LANGUAGE": "en"
+    "OUTPUT_LANGUAGE": "en",
+    "INCLUDE_USERNAME": True,
+    "BANNED_WORDS": ""
 }
 
 config = default_config.copy()
@@ -142,11 +144,35 @@ def clean_whitespace_from_message(message_text):
     return re.sub(r"\s+", " ", message_text).strip()
 
 def format_message_with_username_and_truncate(message_content, author_username, username_prefix_separator, maximum_allowed_length=40):
-    clean_username_without_prefix = author_username.lstrip(username_prefix_separator)
-    combined_message_and_username = f"{message_content} {username_prefix_separator}{clean_username_without_prefix}"
+    include_user = config.get("INCLUDE_USERNAME", True)
+    if isinstance(include_user, str):
+        include_user = include_user.lower() == "true"
+        
+    if include_user:
+        clean_username_without_prefix = author_username.lstrip(username_prefix_separator)
+        combined_message_and_username = f"{message_content} {username_prefix_separator}{clean_username_without_prefix}"
+    else:
+        combined_message_and_username = message_content
+        
     if len(combined_message_and_username) > maximum_allowed_length:
-        return combined_message_and_username[: maximum_allowed_length - 1] + "…"
-    return combined_message_and_username
+        final_msg = combined_message_and_username[: maximum_allowed_length - 1] + "…"
+    else:
+        final_msg = combined_message_and_username
+
+    # Banned words check
+    banned_words_raw = config.get("BANNED_WORDS", "")
+    if banned_words_raw:
+        # Clean all whitespace from the final message for comparison
+        clean_final_msg = "".join(final_msg.split()).lower()
+        
+        # Split banned words supporting both English and Chinese commas, strip all whitespaces from each word, and check
+        normalized_banned_words = banned_words_raw.replace("，", ",")
+        for raw_word in normalized_banned_words.split(","):
+            clean_word = "".join(raw_word.split()).lower()
+            if clean_word and clean_word in clean_final_msg:
+                return None # Comment will not be forwarded
+                
+    return final_msg
 
 def get_youtube_channel_id_from_handle(channel_handle):
     normalized_channel_handle = channel_handle.strip()
@@ -282,6 +308,8 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
             previously_seen_message_ids_queue = collections.deque(maxlen=2000)
             
             def enqueue_msg(tag, msg):
+                if not msg:
+                    return
                 try:
                     future = asyncio.run_coroutine_threadsafe(chat_message_queue.put((tag, msg)), main_loop)
                     future.result() # Wait for it to be added to the queue
@@ -477,7 +505,7 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                         continue
 
                     formatted_final_message = format_message_with_username_and_truncate(cleaned_chat_message, twitch_author_username, "#")
-                    if not chat_message_queue.full():
+                    if formatted_final_message and not chat_message_queue.full():
                         await chat_message_queue.put(("[TW]", formatted_final_message))
 
                 elif "USERNOTICE" in decoded_irc_line:
@@ -494,7 +522,7 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                         if system_msg:
                             message_content = f"{system_msg} {user_msg}".strip()
                             formatted_final_message = format_message_with_username_and_truncate(message_content, display_name, "#")
-                            if not chat_message_queue.full():
+                            if formatted_final_message and not chat_message_queue.full():
                                 await chat_message_queue.put(("[TW]", formatted_final_message))
 
         except Exception as e:

@@ -36,15 +36,29 @@ if not exist "%PYTHON_DIR%\python.exe" (
 
 echo.
 echo ========================================================
-echo Installing Required Libraries...
+echo Checking Dependencies...
 echo ========================================================
-"%PYTHON_EXE%" -m pip install -r requirements.txt
+fc requirements.txt "%PYTHON_DIR%\.requirements.txt" >nul 2>&1
+if errorlevel 1 (
+    echo Installing / updating required libraries...
+    "%PYTHON_EXE%" -m pip install -r requirements.txt
+    copy /y requirements.txt "%PYTHON_DIR%\.requirements.txt" >nul
+) else (
+    echo Dependencies are already up to date.
+)
 
 echo.
 echo ========================================================
-echo Compiling Protocol Buffers...
+echo Checking Protocol Buffers...
 echo ========================================================
-"%PYTHON_EXE%" -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. stream_list.proto
+fc stream_list.proto "%PYTHON_DIR%\.stream_list.proto" >nul 2>&1
+if errorlevel 1 (
+    echo Compiling Protocol Buffers...
+    "%PYTHON_EXE%" -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. stream_list.proto
+    copy /y stream_list.proto "%PYTHON_DIR%\.stream_list.proto" >nul
+) else (
+    echo Protocol buffers are already compiled.
+)
 
 echo.
 echo ========================================================
