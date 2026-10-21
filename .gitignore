@@ -2,3 +2,7 @@ config.json
 python/
 __pycache__/
 log.*
+twitch_events_*.log
+twitch_listener.py
+run_twitch_listener.bat
+twitch_events_wiki.html

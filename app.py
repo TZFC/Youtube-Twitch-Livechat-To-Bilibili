@@ -25,6 +25,11 @@ from googleapiclient.errors import HttpError
 from bilibili_api import Credential, Danmaku
 from bilibili_api.live import LiveRoom
 
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:
+    curl_requests = None
+
 app = FastAPI()
 
 CONFIG_FILE = "config.json"
@@ -174,261 +179,382 @@ def format_message_with_username_and_truncate(message_content, author_username, 
                 
     return final_msg
 
+channel_id_cache = {}
+
 def get_youtube_channel_id_from_handle(channel_handle):
-    normalized_channel_handle = channel_handle.strip()
+    clean_handle = channel_handle.strip()
+    if clean_handle in channel_id_cache:
+        return channel_id_cache[clean_handle]
+
+    normalized_channel_handle = clean_handle
     if normalized_channel_handle.startswith("@"):
         normalized_channel_handle = normalized_channel_handle[1:]
 
     url_encoded_channel_handle = urllib.parse.quote(normalized_channel_handle)
 
-    youtube_api_response = youtube_api_client.channels().list(
-        part="id",
-        forHandle=url_encoded_channel_handle,
-        maxResults=1,
-    ).execute()
+    if not youtube_api_client:
+        return None
 
-    response_items_list = youtube_api_response.get("items", [])
-    if not response_items_list:
-        raise RuntimeError(f"Could not resolve YouTube handle: @{url_encoded_channel_handle}")
+    try:
+        youtube_api_response = youtube_api_client.channels().list(
+            part="id",
+            forHandle=url_encoded_channel_handle,
+            maxResults=1,
+        ).execute()
 
-    return response_items_list[0]["id"]
+        response_items_list = youtube_api_response.get("items", [])
+        if not response_items_list:
+            raise RuntimeError(f"Could not resolve YouTube handle: @{url_encoded_channel_handle}")
 
-def get_current_live_video_id_from_youtube_channel_handle(channel_handle):
+        cid = response_items_list[0]["id"]
+        channel_id_cache[clean_handle] = cid
+        return cid
+    except Exception as e:
+        add_log(f"Error resolving YouTube channel handle: {e}")
+        return None
+
+def verify_youtube_live_chat_status(video_id):
+    if not video_id or not youtube_api_client:
+        return None
+    try:
+        res = youtube_api_client.videos().list(
+            part="snippet,liveStreamingDetails",
+            id=video_id,
+        ).execute()
+        items = res.get("items", [])
+        if not items:
+            return None
+        item = items[0]
+        snippet = item.get("snippet", {})
+        details = item.get("liveStreamingDetails", {})
+
+        broadcast_content = snippet.get("liveBroadcastContent", "none")
+        active_live_chat_id = details.get("activeLiveChatId")
+        actual_end_time = details.get("actualEndTime")
+
+        # Must be an active or upcoming broadcast with an available live chat ID and not already ended
+        if broadcast_content in ("live", "upcoming") and active_live_chat_id and not actual_end_time:
+            return {
+                "video_id": video_id,
+                "title": snippet.get("title", ""),
+                "chat_id": active_live_chat_id,
+                "status": broadcast_content
+            }
+    except Exception as e:
+        add_log(f"Error checking YouTube video {video_id} live status: {e}")
+    return None
+
+def get_current_live_video_info_from_youtube_channel(channel_handle):
     normalized_channel_handle = channel_handle.strip()
-    if not normalized_channel_handle.startswith("@"):
+    if not normalized_channel_handle.startswith("@") and not normalized_channel_handle.startswith("UC"):
         normalized_channel_handle = "@" + normalized_channel_handle
 
-    url_encoded_channel_handle = urllib.parse.quote(normalized_channel_handle)
-    youtube_live_url = f"https://www.youtube.com/{url_encoded_channel_handle}/live"
+    candidate_video_ids = []
+    encoded_handle = urllib.parse.quote(normalized_channel_handle)
+    youtube_live_url = f"https://www.youtube.com/{encoded_handle}/live"
+    html_content_string = ""
+    final_url = ""
 
+    # Primary method: Fetch /live using curl_cffi with Chrome TLS fingerprinting
+    if curl_requests is not None:
+        try:
+            resp = curl_requests.get(youtube_live_url, impersonate="chrome", timeout=10)
+            if resp.status_code == 200:
+                html_content_string = resp.text
+                final_url = resp.url
+        except Exception:
+            pass
+
+    # Fallback to urllib with modern browser headers
+    if not html_content_string:
+        try:
+            http_request = urllib.request.Request(
+                youtube_live_url,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Cache-Control': 'no-cache'
+                }
+            )
+            with urllib.request.urlopen(http_request, timeout=10) as http_response:
+                html_content_string = http_response.read().decode('utf-8', errors='ignore')
+                final_url = http_response.geturl()
+        except Exception:
+            pass
+
+    if html_content_string:
+        # Check redirect
+        m_redirect = re.search(r"[?&]v=([a-zA-Z0-9_-]+)", final_url)
+        if m_redirect:
+            candidate_video_ids.append(m_redirect.group(1))
+
+        # Check canonical watch link
+        canonical_link_match = re.search(r'<link rel="canonical" href="https://www.youtube.com/watch\?v=([a-zA-Z0-9_-]+)">', html_content_string)
+        if canonical_link_match:
+            candidate_video_ids.append(canonical_link_match.group(1))
+
+        # Check liveStreamRenderer
+        live_stream_renderer_match = re.search(r'"liveStreamRenderer":\s*\{\s*"videoId":\s*"([a-zA-Z0-9_-]+)"', html_content_string)
+        if live_stream_renderer_match:
+            candidate_video_ids.append(live_stream_renderer_match.group(1))
+
+        # Check videoDetails
+        video_details_match = re.search(r'"videoDetails":\s*\{\s*"videoId":\s*"([a-zA-Z0-9_-]+)"', html_content_string)
+        if video_details_match:
+            candidate_video_ids.append(video_details_match.group(1))
+
+    # Verify candidates scraped from /live page
+    seen_candidates = set()
+    for vid in candidate_video_ids:
+        if vid and vid not in seen_candidates:
+            seen_candidates.add(vid)
+            verified = verify_youtube_live_chat_status(vid)
+            if verified:
+                return verified
+
+    # Secondary method: Check Channel Uploads Playlist (cost: 1 quota unit for playlist + 1 unit for video verification)
     try:
-        http_request = urllib.request.Request(youtube_live_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(http_request, timeout=10) as http_response:
-            html_content_string = http_response.read().decode('utf-8')
-
-            canonical_link_match = re.search(r'<link rel="canonical" href="https://www.youtube.com/watch\?v=([a-zA-Z0-9_-]+)">', html_content_string)
-            if canonical_link_match:
-                return canonical_link_match.group(1)
-
-            live_stream_renderer_match = re.search(r'"liveStreamRenderer":\s*\{\s*"videoId":\s*"([a-zA-Z0-9_-]+)"', html_content_string)
-            if live_stream_renderer_match:
-                return live_stream_renderer_match.group(1)
-
-            video_details_match = re.search(r'"videoDetails":\s*\{\s*"videoId":\s*"([a-zA-Z0-9_-]+)"', html_content_string)
-            if video_details_match:
-                return video_details_match.group(1)
-    except Exception:
-        pass
-
-    try:
-        api_key = config.get("YOUTUBE_API_KEY")
-        if api_key and api_key != "PASTE_YOUR_YOUTUBE_DATA_API_KEY_HERE":
-            resolved_channel_id = get_youtube_channel_id_from_handle(channel_handle)
-            youtube_api_search_response = youtube_api_client.search().list(
-                part="id",
-                channelId=resolved_channel_id,
-                eventType="live",
-                type="video",
-                maxResults=1,
-                order="date",
+        resolved_channel_id = get_youtube_channel_id_from_handle(channel_handle)
+        if resolved_channel_id and resolved_channel_id.startswith("UC") and youtube_api_client:
+            uploads_playlist_id = "UU" + resolved_channel_id[2:]
+            playlist_response = youtube_api_client.playlistItems().list(
+                part="contentDetails",
+                playlistId=uploads_playlist_id,
+                maxResults=3,
             ).execute()
-
-            search_response_items_list = youtube_api_search_response.get("items", [])
-            if search_response_items_list:
-                return search_response_items_list[0]["id"]["videoId"]
+            for item in playlist_response.get("items", []):
+                vid = item.get("contentDetails", {}).get("videoId")
+                if vid and vid not in seen_candidates:
+                    seen_candidates.add(vid)
+                    verified = verify_youtube_live_chat_status(vid)
+                    if verified:
+                        return verified
     except Exception:
         pass
 
     return None
 
-def get_active_live_chat_id_from_youtube_video_id(video_id):
-    youtube_api_video_response = youtube_api_client.videos().list(
-        part="liveStreamingDetails",
-        id=video_id,
-    ).execute()
+def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_queue, main_loop):
+    creds = grpc.ssl_channel_credentials()
+    grpc_channel_options = [
+        ("grpc.keepalive_time_ms", 30000),
+        ("grpc.keepalive_timeout_ms", 10000),
+        ("grpc.keepalive_permit_without_calls", True),
+        ("grpc.http2.max_pings_without_data", 0),
+        ("grpc.http2.min_time_between_pings_ms", 10000),
+        ("grpc.http2.min_ping_interval_without_data_ms", 5000),
+    ]
 
-    video_response_items_list = youtube_api_video_response.get("items", [])
-    if not video_response_items_list:
-        raise RuntimeError(f"Video not found for video_id={video_id}")
+    metadata = (("x-goog-api-key", api_key),)
+    next_page_token = None
+    is_initial_chat_poll = True
+    previously_seen_message_ids_set = set()
+    previously_seen_message_ids_queue = collections.deque(maxlen=3000)
+    retry_delay_seconds = 2.0
 
-    live_streaming_details_dictionary = video_response_items_list[0].get("liveStreamingDetails", {})
-    active_live_chat_id_string = live_streaming_details_dictionary.get("activeLiveChatId")
-
-    if not active_live_chat_id_string:
-        raise RuntimeError("YouTube stream found, but no activeLiveChatId is available.")
-
-    return active_live_chat_id_string
-
-async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.Queue, channel_handle_string: str):
-    current_live_video_id = None
-    active_live_chat_id = None
-
-    if not channel_handle_string:
-        return
+    def enqueue_msg(tag, msg):
+        if not msg:
+            return
+        try:
+            future = asyncio.run_coroutine_threadsafe(chat_message_queue.put((tag, msg)), main_loop)
+            future.result()
+        except Exception as e:
+            add_log(f"Failed to queue YouTube message: {e}")
 
     while not shutdown_event.is_set():
         try:
-            current_live_video_id = await asyncio.to_thread(get_current_live_video_id_from_youtube_channel_handle, channel_handle_string)
+            with grpc.secure_channel("dns:///youtube.googleapis.com:443", creds, options=grpc_channel_options) as channel:
+                stub = stream_list_pb2_grpc.V3DataLiveChatMessageServiceStub(channel)
 
-            if not current_live_video_id:
-                add_log("Could not find active YouTube live video for handle. Retrying...")
-                await wait_until_timeout_or_shutdown_event(60.0)
-                continue
+                while not shutdown_event.is_set():
+                    request = stream_list_pb2.LiveChatMessageListRequest(
+                        part=["id", "snippet", "authorDetails"],
+                        live_chat_id=active_live_chat_id,
+                        max_results=200,
+                        page_token=next_page_token,
+                    )
 
-            active_live_chat_id = await asyncio.to_thread(get_active_live_chat_id_from_youtube_video_id, current_live_video_id)
-            add_log(f"Found active YouTube live chat ID: {active_live_chat_id}")
-            break
+                    try:
+                        for response in stub.StreamList(request, metadata=metadata):
+                            if shutdown_event.is_set():
+                                return "shutdown"
 
-        except HttpError as http_error_exception:
-            add_log(f"YouTube HTTP Error fetching chat ID: {http_error_exception}")
-            await wait_until_timeout_or_shutdown_event(60.0)
+                            retry_delay_seconds = 2.0  # Reset backoff on receiving messages
+
+                            if is_initial_chat_poll:
+                                for item in response.items:
+                                    msg_id = item.id
+                                    if msg_id and msg_id not in previously_seen_message_ids_set:
+                                        previously_seen_message_ids_queue.append(msg_id)
+                                        previously_seen_message_ids_set.add(msg_id)
+                                is_initial_chat_poll = False
+                                next_page_token = response.next_page_token
+                                continue
+
+                            has_live_stream_ended = False
+                            for item in response.items:
+                                msg_id = item.id
+                                if not msg_id or msg_id in previously_seen_message_ids_set:
+                                    continue
+
+                                if len(previously_seen_message_ids_queue) == 3000:
+                                    oldest_tracked_message_id = previously_seen_message_ids_queue.popleft()
+                                    previously_seen_message_ids_set.discard(oldest_tracked_message_id)
+
+                                previously_seen_message_ids_queue.append(msg_id)
+                                previously_seen_message_ids_set.add(msg_id)
+
+                                event_type = item.snippet.type
+
+                                # Protobuf enums: CHAT_ENDED_EVENT is 4
+                                if event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.CHAT_ENDED_EVENT:
+                                    has_live_stream_ended = True
+                                    break
+
+                                author_display_name = item.author_details.display_name if item.HasField("author_details") else "unknown"
+
+                                if event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.TEXT_MESSAGE_EVENT:
+                                    if item.snippet.HasField("text_message_details"):
+                                        raw_text = item.snippet.text_message_details.message_text
+                                    elif item.snippet.HasField("display_message"):
+                                        raw_text = item.snippet.display_message
+                                    else:
+                                        continue
+
+                                    cleaned_chat = clean_whitespace_and_youtube_emotes_from_message(raw_text)
+                                    if is_text_empty_or_only_punctuation(cleaned_chat):
+                                        continue
+                                    formatted_msg = format_message_with_username_and_truncate(cleaned_chat, author_display_name, "@")
+                                    enqueue_msg("[YT]", formatted_msg)
+
+                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_CHAT_EVENT:
+                                    if item.snippet.HasField("super_chat_details"):
+                                        details = item.snippet.super_chat_details
+                                        amount = details.amount_display_string if details.HasField("amount_display_string") else ""
+                                        comment = details.user_comment if details.HasField("user_comment") else ""
+                                        msg = f"{comment} {amount}".strip()
+                                        formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                        enqueue_msg("[YT]", formatted_msg)
+
+                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_STICKER_EVENT:
+                                    if item.snippet.HasField("super_sticker_details"):
+                                        details = item.snippet.super_sticker_details
+                                        amount = details.amount_display_string if details.HasField("amount_display_string") else ""
+                                        lang = config.get("OUTPUT_LANGUAGE", "en")
+                                        sticker_name = "Super Sticker" if lang == "en" else "超级贴纸"
+                                        msg = f"{sticker_name} {amount}".strip()
+                                        formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                        enqueue_msg("[YT]", formatted_msg)
+
+                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.NEW_SPONSOR_EVENT:
+                                    lang = config.get("OUTPUT_LANGUAGE", "en")
+                                    msg = "New Membership!" if lang == "en" else "新会员！"
+                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                    enqueue_msg("[YT]", formatted_msg)
+
+                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.MEMBERSHIP_GIFTING_EVENT:
+                                    if item.snippet.HasField("membership_gifting_details"):
+                                        details = item.snippet.membership_gifting_details
+                                        count = details.gift_memberships_count if details.HasField("gift_memberships_count") else 1
+                                        lang = config.get("OUTPUT_LANGUAGE", "en")
+                                        msg = f"Gifted {count} Memberships!" if lang == "en" else f"赠送了 {count} 个会员！"
+                                        formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                        enqueue_msg("[YT]", formatted_msg)
+
+                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.GIFT_MEMBERSHIP_RECEIVED_EVENT:
+                                    lang = config.get("OUTPUT_LANGUAGE", "en")
+                                    msg = "Received a Gift Membership!" if lang == "en" else "收到了赠送的会员！"
+                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                    enqueue_msg("[YT]", formatted_msg)
+
+                            if has_live_stream_ended:
+                                add_log("[YouTube] Stream ended event received from chat.")
+                                return "stream_ended"
+
+                            next_page_token = response.next_page_token
+                            if not next_page_token:
+                                break
+
+                    except grpc.RpcError as rpc_error:
+                        if shutdown_event.is_set():
+                            return "shutdown"
+
+                        status_code = rpc_error.code()
+                        details = rpc_error.details() or ""
+
+                        # If chat is ended, closed or not found
+                        if status_code in (grpc.StatusCode.NOT_FOUND, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.INVALID_ARGUMENT):
+                            add_log(f"[YouTube] Live chat ended or unavailable ({status_code.name}): {details}")
+                            return "chat_closed"
+
+                        # Transient error (e.g. 1-hour stream max duration, UNAVAILABLE, DEADLINE_EXCEEDED, CANCELLED)
+                        add_log(f"[YouTube] gRPC stream disconnected ({status_code.name if status_code else 'Error'}), reconnecting in {retry_delay_seconds:.0f}s... ({details})")
+                        break
+
         except Exception as e:
-            add_log(f"YouTube fetch chat ID error: {e}")
-            await wait_until_timeout_or_shutdown_event(10.0)
+            if shutdown_event.is_set():
+                return "shutdown"
+            add_log(f"[YouTube] gRPC channel error: {e}, reconnecting in {retry_delay_seconds:.0f}s...")
 
-    if shutdown_event.is_set():
-        return
+        if shutdown_event.wait(timeout=retry_delay_seconds):
+            return "shutdown"
+        retry_delay_seconds = min(retry_delay_seconds * 1.5, 30.0)
 
-    api_key = config.get("YOUTUBE_API_KEY")
-    if not api_key:
-        add_log("YouTube API key is missing. Cannot start gRPC stream.")
+    return "shutdown"
+
+async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.Queue, channel_handle_string: str):
+    if not channel_handle_string:
         return
 
     main_loop = asyncio.get_running_loop()
 
-    def run_grpc_stream():
-        creds = grpc.ssl_channel_credentials()
-        with grpc.secure_channel("dns:///youtube.googleapis.com:443", creds) as channel:
-            stub = stream_list_pb2_grpc.V3DataLiveChatMessageServiceStub(channel)
-            metadata = (("x-goog-api-key", api_key),)
-            next_page_token = None
-            is_initial_chat_poll = True
-            
-            previously_seen_message_ids_set = set()
-            previously_seen_message_ids_queue = collections.deque(maxlen=2000)
-            
-            def enqueue_msg(tag, msg):
-                if not msg:
-                    return
-                try:
-                    future = asyncio.run_coroutine_threadsafe(chat_message_queue.put((tag, msg)), main_loop)
-                    future.result() # Wait for it to be added to the queue
-                except Exception as e:
-                    add_log(f"Failed to queue YouTube message: {e}")
+    while not shutdown_event.is_set():
+        api_key = config.get("YOUTUBE_API_KEY", "")
+        if not api_key:
+            add_log("[YouTube] API key is missing. Waiting...")
+            await wait_until_timeout_or_shutdown_event(10.0)
+            continue
 
-            while not shutdown_event.is_set():
-                request = stream_list_pb2.LiveChatMessageListRequest(
-                    part=["id", "snippet", "authorDetails"],
-                    live_chat_id=active_live_chat_id,
-                    max_results=200,
-                    page_token=next_page_token,
-                )
-                
-                try:
-                    for response in stub.StreamList(request, metadata=metadata):
-                        if shutdown_event.is_set():
-                            break
-                            
-                        if is_initial_chat_poll:
-                            for item in response.items:
-                                msg_id = item.id
-                                if msg_id and msg_id not in previously_seen_message_ids_set:
-                                    previously_seen_message_ids_queue.append(msg_id)
-                                    previously_seen_message_ids_set.add(msg_id)
-                            is_initial_chat_poll = False
-                            next_page_token = response.next_page_token
-                            continue
+        # Step 1: Discover active live stream or upcoming stream with active chat
+        live_info = None
+        has_logged_waiting = False
+        last_log_time = 0
 
-                        has_live_stream_ended = False
-                        for item in response.items:
-                            msg_id = item.id
-                            if not msg_id or msg_id in previously_seen_message_ids_set:
-                                continue
-                                
-                            if len(previously_seen_message_ids_queue) == 2000:
-                                oldest_tracked_message_id = previously_seen_message_ids_queue.popleft()
-                                previously_seen_message_ids_set.discard(oldest_tracked_message_id)
+        while not shutdown_event.is_set():
+            live_info = await asyncio.to_thread(get_current_live_video_info_from_youtube_channel, channel_handle_string)
 
-                            previously_seen_message_ids_queue.append(msg_id)
-                            previously_seen_message_ids_set.add(msg_id)
-                            
-                            event_type = item.snippet.type
-                            
-                            # Protobuf enums: CHAT_ENDED_EVENT is 4
-                            if event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.CHAT_ENDED_EVENT:
-                                has_live_stream_ended = True
-                                break
-                                
-                            author_display_name = item.author_details.display_name if item.HasField("author_details") else "unknown"
-                            
-                            if event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.TEXT_MESSAGE_EVENT:
-                                if item.snippet.HasField("text_message_details"):
-                                    raw_text = item.snippet.text_message_details.message_text
-                                elif item.snippet.HasField("display_message"):
-                                    raw_text = item.snippet.display_message
-                                else:
-                                    continue
-                                    
-                                cleaned_chat = clean_whitespace_and_youtube_emotes_from_message(raw_text)
-                                if is_text_empty_or_only_punctuation(cleaned_chat):
-                                    continue
-                                formatted_msg = format_message_with_username_and_truncate(cleaned_chat, author_display_name, "@")
-                                enqueue_msg("[YT]", formatted_msg)
-                                
-                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_CHAT_EVENT:
-                                if item.snippet.HasField("super_chat_details"):
-                                    details = item.snippet.super_chat_details
-                                    amount = details.amount_display_string if details.HasField("amount_display_string") else ""
-                                    comment = details.user_comment if details.HasField("user_comment") else ""
-                                    msg = f"{comment} {amount}".strip()
-                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                    enqueue_msg("[YT]", formatted_msg)
-                                    
-                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_STICKER_EVENT:
-                                if item.snippet.HasField("super_sticker_details"):
-                                    details = item.snippet.super_sticker_details
-                                    amount = details.amount_display_string if details.HasField("amount_display_string") else ""
-                                    lang = config.get("OUTPUT_LANGUAGE", "en")
-                                    sticker_name = "Super Sticker" if lang == "en" else "超级贴纸"
-                                    msg = f"{sticker_name} {amount}".strip()
-                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                    enqueue_msg("[YT]", formatted_msg)
-                                    
-                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.NEW_SPONSOR_EVENT:
-                                lang = config.get("OUTPUT_LANGUAGE", "en")
-                                msg = "New Membership!" if lang == "en" else "新会员！"
-                                formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                enqueue_msg("[YT]", formatted_msg)
-                                
-                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.MEMBERSHIP_GIFTING_EVENT:
-                                if item.snippet.HasField("membership_gifting_details"):
-                                    details = item.snippet.membership_gifting_details
-                                    count = details.gift_memberships_count if details.HasField("gift_memberships_count") else 1
-                                    lang = config.get("OUTPUT_LANGUAGE", "en")
-                                    msg = f"Gifted {count} Memberships!" if lang == "en" else f"赠送了 {count} 个会员！"
-                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                    enqueue_msg("[YT]", formatted_msg)
-                                    
-                            elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.GIFT_MEMBERSHIP_RECEIVED_EVENT:
-                                lang = config.get("OUTPUT_LANGUAGE", "en")
-                                msg = "Received a Gift Membership!" if lang == "en" else "收到了赠送的会员！"
-                                formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                enqueue_msg("[YT]", formatted_msg)
+            if live_info:
+                add_log(f"[YouTube] Found active stream '{live_info['title']}' (ID: {live_info['video_id']}, status: {live_info['status']}). Live chat ID: {live_info['chat_id']}")
+                break
 
-                        if has_live_stream_ended:
-                            add_log("YouTube stream ended event received. Shutting down bridge.")
-                            shutdown_event.set()
-                            break
+            now = datetime.datetime.now().timestamp()
+            if not has_logged_waiting or (now - last_log_time >= 300):
+                add_log(f"[YouTube] Channel {channel_handle_string} is not streaming yet. Monitoring for live stream...")
+                has_logged_waiting = True
+                last_log_time = now
 
-                        next_page_token = response.next_page_token
-                        if not next_page_token:
-                            break
-                            
-                except grpc.RpcError as e:
-                    add_log(f"gRPC stream error: {e}")
-                    break
+            await wait_until_timeout_or_shutdown_event(15.0)
 
-    await asyncio.to_thread(run_grpc_stream)
+        if shutdown_event.is_set() or not live_info:
+            return
+
+        # Step 2: Stream chat messages via gRPC with auto-reconnection
+        active_live_chat_id = live_info["chat_id"]
+        result = await asyncio.to_thread(
+            run_grpc_stream_with_reconnect,
+            active_live_chat_id,
+            api_key,
+            chat_message_queue,
+            main_loop,
+        )
+
+        if shutdown_event.is_set():
+            return
+
+        if result in ("stream_ended", "chat_closed"):
+            add_log("[YouTube] Stream ended or chat closed. Returning to monitoring mode for next stream...")
+            await wait_until_timeout_or_shutdown_event(10.0)
 
 async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Queue):
     twitch_irc_server_address = "irc.chat.twitch.tv"
@@ -600,20 +726,22 @@ def api_get_status():
 
 @app.post("/api/config")
 async def api_save_config(request: Request):
-    global config
+    global config, channel_id_cache
     new_config = await request.json()
     config.update(new_config)
+    channel_id_cache.clear()
     save_config()
     return {"status": "ok"}
 
 @app.post("/api/start")
 async def api_start():
-    global bridge_task, shutdown_event, bilibili_live_room, youtube_api_client
+    global bridge_task, shutdown_event, bilibili_live_room, youtube_api_client, channel_id_cache
     
     if bridge_task and not bridge_task.done():
         return {"status": "already running"}
         
     shutdown_event = asyncio.Event()
+    channel_id_cache.clear()
 
     try:
         if config.get("SESSDATA"):
