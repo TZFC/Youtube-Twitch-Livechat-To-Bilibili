@@ -10,6 +10,12 @@ import os
 import sys
 import datetime
 import grpc
+import requests
+import io
+import base64
+import uuid
+import time
+import qrcode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -22,7 +28,8 @@ import stream_list_pb2_grpc
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from bilibili_api import Credential, Danmaku
+from bilibili_api import Credential, Danmaku, login_v2
+from bilibili_api.utils.network import get_buvid
 from bilibili_api.live import LiveRoom
 
 try:
@@ -34,11 +41,18 @@ app = FastAPI()
 
 CONFIG_FILE = "config.json"
 
+BILI_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Referer": "https://www.bilibili.com/",
+}
+
 default_config = {
     "SESSDATA": "",
     "BILI_JCT": "",
     "BUVID3": "",
+    "BUVID4": "",
     "DEDEUSERID": "",
+    "AC_TIME_VALUE": "",
     "BILIBILI_ROOM_ID": 23596840,
     "YOUTUBE_CHANNEL_HANDLE": "@沐晓空",
     "TWITCH_CHANNEL": "muxiaokong",
@@ -65,6 +79,75 @@ def save_config():
         json.dump(config, f, indent=4)
 
 load_config()
+
+def build_bilibili_credential() -> Credential:
+    return Credential(
+        sessdata=config.get("SESSDATA", ""),
+        bili_jct=config.get("BILI_JCT", ""),
+        buvid3=config.get("BUVID3", ""),
+        buvid4=config.get("BUVID4", ""),
+        dedeuserid=str(config.get("DEDEUSERID", "")) if config.get("DEDEUSERID") else None,
+        ac_time_value=config.get("AC_TIME_VALUE", ""),
+    )
+
+async def check_and_refresh_bilibili_credentials(force: bool = False) -> dict:
+    global config
+    if not config.get("SESSDATA"):
+        return {"status": "no_credentials", "message": "No SESSDATA configured", "valid": False}
+
+    cred = build_bilibili_credential()
+
+    is_valid = False
+    try:
+        is_valid = await cred.check_valid()
+    except Exception:
+        is_valid = False
+
+    needs_refresh = False
+    try:
+        needs_refresh = await cred.check_refresh()
+    except Exception:
+        needs_refresh = False
+
+    should_refresh = force or needs_refresh or (not is_valid and bool(config.get("AC_TIME_VALUE")))
+
+    if should_refresh:
+        if not config.get("AC_TIME_VALUE"):
+            msg = "Bilibili cookies need refresh, but no AC_TIME_VALUE (refresh token) is present. Please re-login via QR code."
+            add_log(msg)
+            return {"status": "missing_token", "message": msg, "valid": is_valid}
+
+        try:
+            add_log("Attempting Bilibili cookie refresh with AC_TIME_VALUE...")
+            await cred.refresh()
+            config["SESSDATA"] = cred.sessdata or ""
+            config["BILI_JCT"] = cred.bili_jct or ""
+            config["DEDEUSERID"] = str(cred.dedeuserid or "")
+            config["AC_TIME_VALUE"] = cred.ac_time_value or ""
+            save_config()
+            add_log("Bilibili cookies successfully refreshed and updated in config.json!")
+            return {"status": "refreshed", "message": "Cookies refreshed successfully", "valid": True}
+        except Exception as e:
+            msg = f"Failed to refresh Bilibili cookies: {e}. Please re-login via QR code."
+            add_log(msg)
+            return {"status": "error", "message": msg, "valid": is_valid}
+
+    return {
+        "status": "ok" if is_valid else "invalid",
+        "valid": is_valid,
+        "needs_refresh": needs_refresh,
+        "message": "Cookies are valid" if is_valid else "Cookies invalid or expired"
+    }
+
+async def bilibili_cookie_keeper_task():
+    await asyncio.sleep(5)
+    while True:
+        try:
+            if config.get("SESSDATA") and config.get("AC_TIME_VALUE"):
+                await check_and_refresh_bilibili_credentials(force=False)
+        except Exception as e:
+            add_log(f"Cookie keeper error: {e}")
+        await asyncio.sleep(6 * 3600)
 
 def add_log(msg: str):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -757,6 +840,199 @@ def api_get_config():
 def api_get_status():
     return {"running": bridge_task is not None and not bridge_task.done()}
 
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(bilibili_cookie_keeper_task())
+
+qr_login_sessions = {}
+
+def clean_expired_qr_sessions():
+    now = time.time()
+    expired = [sid for sid, s in qr_login_sessions.items() if now - s.get("created_at", 0) > 600]
+    for sid in expired:
+        qr_login_sessions.pop(sid, None)
+
+@app.get("/api/bilibili/status")
+async def api_bilibili_status():
+    if not config.get("SESSDATA"):
+        return {
+            "logged_in": False,
+            "valid": False,
+            "needs_refresh": False,
+            "dedeuserid": "",
+            "has_ac_time_value": False
+        }
+
+    cred = build_bilibili_credential()
+    is_valid = False
+    needs_refresh = False
+    try:
+        is_valid = await cred.check_valid()
+    except Exception:
+        is_valid = False
+
+    try:
+        needs_refresh = await cred.check_refresh()
+    except Exception:
+        needs_refresh = False
+
+    return {
+        "logged_in": is_valid,
+        "valid": is_valid,
+        "needs_refresh": needs_refresh,
+        "dedeuserid": str(config.get("DEDEUSERID", "")),
+        "has_ac_time_value": bool(config.get("AC_TIME_VALUE"))
+    }
+
+@app.post("/api/bilibili/refresh")
+async def api_bilibili_refresh():
+    result = await check_and_refresh_bilibili_credentials(force=True)
+    return result
+
+@app.post("/api/bilibili/qrcode/start")
+async def api_bilibili_qrcode_start():
+    clean_expired_qr_sessions()
+    session_id = str(uuid.uuid4())
+    loop = asyncio.get_running_loop()
+
+    def _generate():
+        resp = requests.get(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/generate",
+            headers=BILI_HEADERS,
+            timeout=10
+        )
+        return resp.json()
+
+    try:
+        data = await loop.run_in_executor(None, _generate)
+    except Exception as e:
+        return {"status": "error", "message": f"Network error generating QR code: {e}"}
+
+    if data.get("code") != 0:
+        return {"status": "error", "message": data.get("message", "Failed to generate QR code from Bilibili")}
+
+    qr_data = data.get("data", {})
+    qr_url = qr_data.get("url", "")
+    qrcode_key = qr_data.get("qrcode_key", "")
+
+    qr_builder = qrcode.QRCode(box_size=6, border=2)
+    qr_builder.add_data(qr_url)
+    qr_builder.make(fit=True)
+    img = qr_builder.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    img_base64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    qr_login_sessions[session_id] = {
+        "qrcode_key": qrcode_key,
+        "qr_url": qr_url,
+        "created_at": time.time()
+    }
+
+    return {
+        "session_id": session_id,
+        "qrcode_img": img_base64,
+        "url": qr_url
+    }
+
+@app.get("/api/bilibili/qrcode/poll")
+async def api_bilibili_qrcode_poll(session_id: str):
+    clean_expired_qr_sessions()
+    session_data = qr_login_sessions.get(session_id)
+    if not session_data:
+        return {"status": "timeout", "message": "QR code session expired. Please refresh."}
+
+    qrcode_key = session_data["qrcode_key"]
+    loop = asyncio.get_running_loop()
+
+    def _poll():
+        session = requests.Session()
+        resp = session.get(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+            params={"qrcode_key": qrcode_key},
+            headers=BILI_HEADERS,
+            timeout=10
+        )
+        json_data = resp.json()
+        cookies_dict = session.cookies.get_dict()
+
+        # Follow crossDomain URL if present to capture cross-domain tickets/cookies
+        url = json_data.get("data", {}).get("url", "")
+        if json_data.get("data", {}).get("code") == 0 and url:
+            try:
+                session.get(url, headers=BILI_HEADERS, timeout=10)
+                cookies_dict.update(session.cookies.get_dict())
+            except Exception as e:
+                add_log(f"CrossDomain ticket fetch notice: {e}")
+
+        return json_data, cookies_dict
+
+    try:
+        res_json, captured_cookies = await loop.run_in_executor(None, _poll)
+    except Exception as e:
+        return {"status": "waiting", "message": f"Polling error: {e}"}
+
+    poll_data = res_json.get("data", {})
+    code = poll_data.get("code")
+
+    if code == 86101:
+        return {"status": "scan", "message": "Waiting for scan..."}
+    elif code == 86090:
+        return {"status": "conf", "message": "Scanned! Please confirm login on your Bilibili App."}
+    elif code == 86038:
+        qr_login_sessions.pop(session_id, None)
+        return {"status": "timeout", "message": "QR code timed out. Please try again."}
+    elif code == 0:
+        qr_login_sessions.pop(session_id, None)
+
+        sessdata = captured_cookies.get("SESSDATA", "")
+        bili_jct = captured_cookies.get("bili_jct", "")
+        dedeuserid = captured_cookies.get("DedeUserID", "")
+        refresh_token = poll_data.get("refresh_token", "")
+
+        # Fallback to query string if needed
+        url = poll_data.get("url", "")
+        if ("?" in url) and (not sessdata or not bili_jct or not dedeuserid):
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            if not sessdata and "SESSDATA" in qs:
+                sessdata = qs["SESSDATA"][0]
+            if not bili_jct and "bili_jct" in qs:
+                bili_jct = qs["bili_jct"][0]
+            if not dedeuserid and "DedeUserID" in qs:
+                dedeuserid = qs["DedeUserID"][0]
+
+        if not sessdata or not bili_jct:
+            add_log(f"Warning: QR login code=0 but cookies missing. captured={list(captured_cookies.keys())}, url={url}")
+            return {
+                "status": "error",
+                "message": "Login succeeded on phone, but cookies could not be captured. Please try again."
+            }
+
+        try:
+            buvid3, buvid4 = await get_buvid()
+        except Exception:
+            buvid3, buvid4 = "", ""
+
+        config["SESSDATA"] = sessdata
+        config["BILI_JCT"] = bili_jct
+        config["DEDEUSERID"] = str(dedeuserid)
+        config["AC_TIME_VALUE"] = refresh_token
+        if buvid3:
+            config["BUVID3"] = buvid3
+        if buvid4:
+            config["BUVID4"] = buvid4
+        save_config()
+
+        add_log(f"Bilibili login successful via QR code for UID {config['DEDEUSERID']}! SESSDATA, bili_jct, and AC_TIME_VALUE captured.")
+        return {
+            "status": "done",
+            "message": "Login successful!",
+            "dedeuserid": config["DEDEUSERID"],
+            "config": config
+        }
+    else:
+        return {"status": "waiting", "message": "Waiting for scan..."}
+
 @app.post("/api/config")
 async def api_save_config(request: Request):
     global config, channel_id_cache
@@ -779,12 +1055,9 @@ async def api_start():
 
     try:
         if config.get("SESSDATA"):
-            bilibili_credential = Credential(
-                sessdata=config.get("SESSDATA", ""),
-                bili_jct=config.get("BILI_JCT", ""),
-                buvid3=config.get("BUVID3", ""),
-                dedeuserid=config.get("DEDEUSERID", ""),
-            )
+            if config.get("AC_TIME_VALUE"):
+                await check_and_refresh_bilibili_credentials(force=False)
+            bilibili_credential = build_bilibili_credential()
             bilibili_live_room = LiveRoom(int(config.get("BILIBILI_ROOM_ID", 0)), credential=bilibili_credential)
         else:
             bilibili_live_room = None

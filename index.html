@@ -200,6 +200,163 @@
         }
         .status.running { color: var(--btn-green); }
         .status.stopped { color: #5f6368; }
+
+        /* Bilibili Auth Card */
+        .bili-auth-card {
+            background-color: var(--input-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 14px;
+            margin-bottom: 16px;
+        }
+        .bili-auth-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .bili-status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            background-color: #80868b;
+        }
+        .status-dot.green { background-color: #1e8e3e; }
+        .status-dot.yellow { background-color: #f9ab00; }
+        .status-dot.red { background-color: #d93025; }
+
+        .bili-auth-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .bili-btn {
+            padding: 7px 12px;
+            border: none;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s, opacity 0.2s;
+            color: white;
+            text-align: center;
+        }
+        .bili-btn.primary-btn {
+            background-color: #00aeec;
+        }
+        .bili-btn.primary-btn:hover {
+            background-color: #009ad0;
+        }
+        .bili-btn.secondary-btn {
+            background-color: #5f6368;
+        }
+        .bili-btn.secondary-btn:hover {
+            background-color: #494c4f;
+        }
+
+        /* Collapsible Advanced Section */
+        .advanced-cookie-details {
+            margin-top: 12px;
+            margin-bottom: 16px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 10px 14px;
+            background: #fafafa;
+        }
+        .advanced-cookie-details summary {
+            font-size: 13px;
+            font-weight: 500;
+            color: #5f6368;
+            cursor: pointer;
+            user-select: none;
+            outline: none;
+        }
+        .advanced-cookie-details .form-group {
+            margin-top: 12px;
+            margin-bottom: 12px;
+        }
+
+        /* Modal styles */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0, 0, 0, 0.55);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        .modal-content {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            width: 320px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.24);
+            text-align: center;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 14px;
+        }
+        .modal-header h3 {
+            margin: 0;
+            font-size: 16px;
+            color: var(--text-color);
+        }
+        .modal-close {
+            font-size: 22px;
+            cursor: pointer;
+            color: #5f6368;
+            line-height: 1;
+        }
+        .qr-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 210px;
+            background: #f1f3f4;
+            border-radius: 4px;
+            margin-bottom: 12px;
+            padding: 10px;
+        }
+        .qr-container img {
+            max-width: 200px;
+            max-height: 200px;
+            border-radius: 4px;
+            background: white;
+        }
+        .qr-status-text {
+            font-size: 13px;
+            color: #3c4043;
+            min-height: 38px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 500;
+        }
+        .modal-footer {
+            display: flex;
+            gap: 10px;
+            margin-top: 14px;
+        }
+        .modal-footer button {
+            flex: 1;
+            padding: 8px;
+            font-size: 13px;
+        }
     </style>
 </head>
 <body>
@@ -231,36 +388,62 @@
             </div>
         </div>
 
-        <div class="section-title">Bilibili Credentials</div>
-        <div class="form-group">
-            <label>SESSDATA</label>
-            <div class="password-container">
-                <input type="password" name="SESSDATA" id="SESSDATA">
-                <span class="toggle-password" onclick="togglePassword('SESSDATA', this)">👁️</span>
+        <div class="section-title">Bilibili Settings & Authentication</div>
+        
+        <div class="bili-auth-card">
+            <div class="bili-auth-header">
+                <div class="bili-status-indicator">
+                    <span id="biliStatusDot" class="status-dot"></span>
+                    <span id="biliStatusText">Checking login status...</span>
+                </div>
+                <div class="bili-auth-actions">
+                    <button type="button" id="biliQrBtn" class="bili-btn primary-btn" onclick="openQrModal()">📱 Scan QR Code to Login</button>
+                    <button type="button" id="biliRefreshBtn" class="bili-btn secondary-btn" onclick="triggerManualRefresh()">🔄 Refresh</button>
+                </div>
             </div>
         </div>
-        <div class="form-group">
-            <label>BILI_JCT</label>
-            <div class="password-container">
-                <input type="password" name="BILI_JCT" id="BILI_JCT">
-                <span class="toggle-password" onclick="togglePassword('BILI_JCT', this)">👁️</span>
-            </div>
-        </div>
-        <div class="form-group">
-            <label>BUVID3</label>
-            <div class="password-container">
-                <input type="password" name="BUVID3" id="BUVID3">
-                <span class="toggle-password" onclick="togglePassword('BUVID3', this)">👁️</span>
-            </div>
-        </div>
-        <div class="form-group">
-            <label>DEDEUSERID</label>
-            <input type="text" name="DEDEUSERID" id="DEDEUSERID">
-        </div>
+
         <div class="form-group">
             <label>BILIBILI_ROOM_ID</label>
             <input type="number" name="BILIBILI_ROOM_ID" id="BILIBILI_ROOM_ID">
         </div>
+
+        <details class="advanced-cookie-details">
+            <summary>Manual / Advanced Cookie Configuration (Optional)</summary>
+            <div class="form-group">
+                <label>SESSDATA</label>
+                <div class="password-container">
+                    <input type="password" name="SESSDATA" id="SESSDATA">
+                    <span class="toggle-password" onclick="togglePassword('SESSDATA', this)">👁️</span>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>BILI_JCT</label>
+                <div class="password-container">
+                    <input type="password" name="BILI_JCT" id="BILI_JCT">
+                    <span class="toggle-password" onclick="togglePassword('BILI_JCT', this)">👁️</span>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>BUVID3</label>
+                <div class="password-container">
+                    <input type="password" name="BUVID3" id="BUVID3">
+                    <span class="toggle-password" onclick="togglePassword('BUVID3', this)">👁️</span>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>DEDEUSERID</label>
+                <input type="text" name="DEDEUSERID" id="DEDEUSERID">
+            </div>
+            <div class="form-group">
+                <label>AC_TIME_VALUE (Refresh Token)</label>
+                <div class="password-container">
+                    <input type="password" name="AC_TIME_VALUE" id="AC_TIME_VALUE">
+                    <span class="toggle-password" onclick="togglePassword('AC_TIME_VALUE', this)">👁️</span>
+                </div>
+            </div>
+            <input type="hidden" name="BUVID4" id="BUVID4">
+        </details>
 
         <div class="section-title">Source Platforms</div>
         <div class="form-group">
@@ -333,6 +516,136 @@
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
     const statusText = document.getElementById('statusText');
+
+    let qrPollInterval = null;
+    let activeQrSessionId = null;
+
+    async function checkBilibiliStatus() {
+        const dot = document.getElementById('biliStatusDot');
+        const text = document.getElementById('biliStatusText');
+        try {
+            const res = await fetch('/api/bilibili/status');
+            const data = await res.json();
+            if (data.logged_in) {
+                dot.className = "status-dot green";
+                text.textContent = `Logged in (UID: ${data.dedeuserid})`;
+            } else if (data.needs_refresh) {
+                dot.className = "status-dot yellow";
+                text.textContent = `Session needs refresh (UID: ${data.dedeuserid || 'Unknown'})`;
+            } else {
+                dot.className = "status-dot red";
+                text.textContent = data.dedeuserid ? `Session expired (UID: ${data.dedeuserid})` : "Not logged in";
+            }
+        } catch (e) {
+            console.error("Failed to check Bilibili status", e);
+            dot.className = "status-dot";
+            text.textContent = "Error checking Bilibili status";
+        }
+    }
+
+    function openQrModal() {
+        document.getElementById('qrModal').style.display = 'flex';
+        fetchQrCode();
+    }
+
+    function closeQrModal() {
+        document.getElementById('qrModal').style.display = 'none';
+        if (qrPollInterval) {
+            clearInterval(qrPollInterval);
+            qrPollInterval = null;
+        }
+        activeQrSessionId = null;
+    }
+
+    async function fetchQrCode() {
+        if (qrPollInterval) {
+            clearInterval(qrPollInterval);
+            qrPollInterval = null;
+        }
+        const qrImage = document.getElementById('qrImage');
+        const qrLoading = document.getElementById('qrLoading');
+        const qrStatusText = document.getElementById('qrStatusText');
+        
+        qrImage.style.display = 'none';
+        qrLoading.style.display = 'block';
+        qrLoading.textContent = 'Generating QR code...';
+        qrStatusText.textContent = 'Open Bilibili App -> Scan QR Code -> Confirm';
+
+        try {
+            const res = await fetch('/api/bilibili/qrcode/start', { method: 'POST' });
+            const data = await res.json();
+            activeQrSessionId = data.session_id;
+
+            qrImage.src = data.qrcode_img;
+            qrImage.style.display = 'block';
+            qrLoading.style.display = 'none';
+
+            // Start polling every 2s
+            qrPollInterval = setInterval(pollQrCodeState, 2000);
+        } catch (e) {
+            console.error("Failed to start QR login", e);
+            qrLoading.textContent = 'Failed to generate QR code.';
+        }
+    }
+
+    async function pollQrCodeState() {
+        if (!activeQrSessionId) return;
+        try {
+            const res = await fetch(`/api/bilibili/qrcode/poll?session_id=${encodeURIComponent(activeQrSessionId)}`);
+            const data = await res.json();
+            const qrStatusText = document.getElementById('qrStatusText');
+
+            if (data.status === 'scan') {
+                qrStatusText.textContent = 'Waiting for scan...';
+            } else if (data.status === 'conf') {
+                qrStatusText.textContent = 'Scanned! Please confirm login on your Bilibili App.';
+            } else if (data.status === 'timeout') {
+                qrStatusText.textContent = 'QR Code timed out. Click Reload to try again.';
+                clearInterval(qrPollInterval);
+                qrPollInterval = null;
+            } else if (data.status === 'error') {
+                qrStatusText.textContent = data.message || 'Login failed. Please reload QR code.';
+                clearInterval(qrPollInterval);
+                qrPollInterval = null;
+            } else if (data.status === 'done') {
+                qrStatusText.textContent = 'Login successful!';
+                clearInterval(qrPollInterval);
+                qrPollInterval = null;
+
+                if (data.config) {
+                    for (const key in data.config) {
+                        if (form.elements[key]) {
+                            form.elements[key].value = data.config[key];
+                        }
+                    }
+                }
+                await checkBilibiliStatus();
+                setTimeout(() => {
+                    closeQrModal();
+                }, 1200);
+            }
+        } catch (e) {
+            console.error("Polling error", e);
+        }
+    }
+
+    async function triggerManualRefresh() {
+        const btn = document.getElementById('biliRefreshBtn');
+        btn.disabled = true;
+        btn.textContent = 'Refreshing...';
+        try {
+            const res = await fetch('/api/bilibili/refresh', { method: 'POST' });
+            const data = await res.json();
+            alert(data.message || (data.valid ? "Cookies refreshed successfully!" : "Failed to refresh."));
+            await checkBilibiliStatus();
+            await loadConfig();
+        } catch (e) {
+            alert("Error triggering refresh: " + e.message);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '🔄 Refresh';
+        }
+    }
 
     function togglePassword(inputId, iconElement) {
         const input = document.getElementById(inputId);
@@ -446,7 +759,10 @@
     }
 
     // Init
-    loadConfig().then(checkStatus);
+    loadConfig().then(() => {
+        checkStatus();
+        checkBilibiliStatus();
+    });
     updateLogs();
     
     // Periodically check status in case it stopped due to error
@@ -455,6 +771,27 @@
         updateLogs();
     }, 2000);
 </script>
+
+
+<div id="qrModal" class="modal-overlay" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Scan with Bilibili App</h3>
+            <span class="modal-close" onclick="closeQrModal()">&times;</span>
+        </div>
+        <div class="modal-body">
+            <div id="qrContainer" class="qr-container">
+                <div id="qrLoading">Generating QR code...</div>
+                <img id="qrImage" src="" alt="Bilibili QR Code" style="display: none;" />
+            </div>
+            <div id="qrStatusText" class="qr-status-text">Open Bilibili App -> Scan QR Code -> Confirm</div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="bili-btn secondary-btn" onclick="fetchQrCode()">🔄 Reload</button>
+            <button type="button" class="bili-btn secondary-btn" onclick="closeQrModal()">Close</button>
+        </div>
+    </div>
+</div>
 
 </body>
 </html>
