@@ -81,6 +81,7 @@ shutdown_event = None
 bridge_task = None
 
 bilibili_live_room = None
+bilibili_real_room_id = None
 youtube_api_client = None
 
 twitch_privmsg_pattern = re.compile(r"^(?:@([^\s]+)\s+)?:(\w+)!.*?PRIVMSG.*? :(.*)$")
@@ -358,7 +359,7 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
             return
         try:
             future = asyncio.run_coroutine_threadsafe(chat_message_queue.put((tag, msg)), main_loop)
-            future.result()
+            future.result(timeout=5.0)
         except Exception as e:
             add_log(f"Failed to queue YouTube message: {e}")
 
@@ -631,7 +632,7 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                         continue
 
                     formatted_final_message = format_message_with_username_and_truncate(cleaned_chat_message, twitch_author_username, "#")
-                    if formatted_final_message and not chat_message_queue.full():
+                    if formatted_final_message:
                         await chat_message_queue.put(("[TW]", formatted_final_message))
 
                 elif "USERNOTICE" in decoded_irc_line:
@@ -648,7 +649,7 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                         if system_msg:
                             message_content = f"{system_msg} {user_msg}".strip()
                             formatted_final_message = format_message_with_username_and_truncate(message_content, display_name, "#")
-                            if formatted_final_message and not chat_message_queue.full():
+                            if formatted_final_message:
                                 await chat_message_queue.put(("[TW]", formatted_final_message))
 
         except Exception as e:
@@ -664,24 +665,56 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                     pass
 
 async def send_queued_messages_to_bilibili_live_room(chat_message_queue: asyncio.Queue):
+    global bilibili_real_room_id
     while not shutdown_event.is_set() or not chat_message_queue.empty():
         try:
             message_source_tag, chat_message_content = await asyncio.wait_for(chat_message_queue.get(), timeout=1.0)
         except asyncio.TimeoutError:
             continue
 
-        try:
-            if bilibili_live_room:
-                await bilibili_live_room.send_danmaku(Danmaku(chat_message_content))
-            await asyncio.sleep(1.0)
-        except Exception as e:
-            add_log(f"Bilibili send error: {e}")
-            await asyncio.sleep(1.0)
-        finally:
+        if not bilibili_live_room:
             chat_message_queue.task_done()
+            continue
+
+        # Cache real room_id once to avoid redundant get_room_play_info HTTP calls on every message
+        if bilibili_real_room_id is None and bilibili_live_room:
+            try:
+                room_info = await bilibili_live_room.get_room_play_info()
+                bilibili_real_room_id = room_info.get("room_id")
+            except Exception as e:
+                add_log(f"Warning: Could not get Bilibili real room id: {e}")
+                bilibili_real_room_id = int(config.get("BILIBILI_ROOM_ID", 0))
+
+        target_room_id = bilibili_real_room_id if bilibili_real_room_id else None
+        max_retries = 3
+        send_success = False
+
+        for attempt in range(max_retries + 1):
+            if shutdown_event.is_set():
+                break
+
+            try:
+                await bilibili_live_room.send_danmaku(
+                    Danmaku(chat_message_content),
+                    room_id=target_room_id
+                )
+                send_success = True
+                break
+            except Exception as e:
+                if attempt < max_retries:
+                    add_log(f"Bilibili send error ({message_source_tag}): {e}. Retrying ({attempt + 1}/{max_retries}) in 1s...")
+                    await wait_until_timeout_or_shutdown_event(1.0)
+                else:
+                    add_log(f"Bilibili send error ({message_source_tag}): {e}. Dropping message after {max_retries} retries: {chat_message_content}")
+
+        chat_message_queue.task_done()
+
+        if send_success:
+            # Maintain 1 second spacing between successfully delivered messages to respect Bilibili danmaku rate limits
+            await wait_until_timeout_or_shutdown_event(1.0)
 
 async def run_youtube_and_twitch_to_bilibili_chat_bridge():
-    bridge_message_queue = asyncio.Queue(maxsize=50)
+    bridge_message_queue = asyncio.Queue()
 
     try:
         await asyncio.gather(
@@ -735,13 +768,14 @@ async def api_save_config(request: Request):
 
 @app.post("/api/start")
 async def api_start():
-    global bridge_task, shutdown_event, bilibili_live_room, youtube_api_client, channel_id_cache
+    global bridge_task, shutdown_event, bilibili_live_room, bilibili_real_room_id, youtube_api_client, channel_id_cache
     
     if bridge_task and not bridge_task.done():
         return {"status": "already running"}
         
     shutdown_event = asyncio.Event()
     channel_id_cache.clear()
+    bilibili_real_room_id = None
 
     try:
         if config.get("SESSDATA"):
