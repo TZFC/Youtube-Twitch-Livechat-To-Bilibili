@@ -54,7 +54,10 @@ default_config = {
     "YOUTUBE_API_KEY": "",
     "OUTPUT_LANGUAGE": "en",
     "INCLUDE_USERNAME": True,
-    "BANNED_WORDS": ""
+    "BANNED_WORDS": "",
+    "YOUTUBE_POLL_BASE_DELAY_SECONDS": "2",
+    "YOUTUBE_POLL_MULTIPLIER": "2",
+    "YOUTUBE_MAX_POLL_DELAY_SECONDS": "30"
 }
 
 config = default_config.copy()
@@ -274,21 +277,19 @@ def get_youtube_channel_id_from_handle(channel_handle):
     if normalized_channel_handle.startswith("@"):
         normalized_channel_handle = normalized_channel_handle[1:]
 
-    url_encoded_channel_handle = urllib.parse.quote(normalized_channel_handle)
-
     if not youtube_api_client:
         return None
 
     try:
         youtube_api_response = youtube_api_client.channels().list(
             part="id",
-            forHandle=url_encoded_channel_handle,
+            forHandle=normalized_channel_handle,
             maxResults=1,
         ).execute()
 
         response_items_list = youtube_api_response.get("items", [])
         if not response_items_list:
-            raise RuntimeError(f"Could not resolve YouTube handle: @{url_encoded_channel_handle}")
+            raise RuntimeError(f"Could not resolve YouTube handle: @{normalized_channel_handle}")
 
         cid = response_items_list[0]["id"]
         channel_id_cache[clean_handle] = cid
@@ -379,6 +380,22 @@ def wait_in_thread_for_shutdown(timeout_seconds):
         time.sleep(min(0.25, remaining))
     return True
 
+def _get_youtube_poll_backoff_settings():
+    """Read YouTube idle-chat exponential backoff settings from config."""
+    try:
+        base_delay = max(0.5, float(config.get("YOUTUBE_POLL_BASE_DELAY_SECONDS", 2.0)))
+    except (TypeError, ValueError):
+        base_delay = 2.0
+    try:
+        multiplier = max(1.0, float(config.get("YOUTUBE_POLL_MULTIPLIER", 2.0)))
+    except (TypeError, ValueError):
+        multiplier = 2.0
+    try:
+        max_delay = max(base_delay, float(config.get("YOUTUBE_MAX_POLL_DELAY_SECONDS", 30.0)))
+    except (TypeError, ValueError):
+        max_delay = max(base_delay, 30.0)
+    return base_delay, multiplier, max_delay
+
 def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_queue, main_loop):
     global active_grpc_call
     creds = grpc.ssl_channel_credentials()
@@ -396,7 +413,10 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
     is_initial_chat_poll = True
     previously_seen_message_ids_set = set()
     previously_seen_message_ids_queue = collections.deque(maxlen=3000)
-    retry_delay_seconds = 2.0
+
+    base_poll_delay, poll_multiplier, max_poll_delay = _get_youtube_poll_backoff_settings()
+    idle_poll_delay_seconds = base_poll_delay
+    error_retry_delay_seconds = base_poll_delay
 
     def track_seen_message_id(msg_id):
         if not msg_id or msg_id in previously_seen_message_ids_set:
@@ -432,6 +452,11 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
                     request = stream_list_pb2.LiveChatMessageListRequest(**request_kwargs)
 
                     should_recreate_channel = False
+                    saw_initial_poll_this_call = False
+                    saw_new_chat_items = False
+                    next_wait_seconds = error_retry_delay_seconds
+                    is_error_retry = False
+
                     try:
                         stream_call = stub.StreamList(request, metadata=metadata)
                         active_grpc_call = stream_call
@@ -439,12 +464,13 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
                             if shutdown_event.is_set():
                                 return "shutdown"
 
-                            retry_delay_seconds = 2.0  # Reset backoff on receiving payloads
+                            error_retry_delay_seconds = base_poll_delay  # Connection is healthy
 
                             if is_initial_chat_poll:
                                 for item in response.items:
                                     track_seen_message_id(item.id)
                                 is_initial_chat_poll = False
+                                saw_initial_poll_this_call = True
                                 if response.next_page_token:
                                     next_page_token = response.next_page_token
                                 continue
@@ -461,6 +487,7 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
                                     has_live_stream_ended = True
                                     break
 
+                                saw_new_chat_items = True
                                 author_display_name = item.author_details.display_name if item.HasField("author_details") else "unknown"
 
                                 if event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.TEXT_MESSAGE_EVENT:
@@ -526,9 +553,16 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
 
                         if shutdown_event.is_set():
                             return "shutdown"
-                        add_log(f"[YouTube] gRPC stream ended cleanly, resuming in {retry_delay_seconds:.0f}s (page_token preserved={bool(next_page_token)})...")
+
+                        if saw_new_chat_items or saw_initial_poll_this_call:
+                            idle_poll_delay_seconds = base_poll_delay
+                            next_wait_seconds = base_poll_delay
+                        else:
+                            idle_poll_delay_seconds = min(idle_poll_delay_seconds * poll_multiplier, max_poll_delay)
+                            next_wait_seconds = idle_poll_delay_seconds
 
                     except grpc.RpcError as rpc_error:
+                        is_error_retry = True
                         if shutdown_event.is_set():
                             return "shutdown"
 
@@ -541,35 +575,37 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
 
                         if status_code == grpc.StatusCode.INVALID_ARGUMENT:
                             if next_page_token:
-                                add_log(f"[YouTube] Resumption page_token expired or invalid ({details}); resetting page_token and reconnecting in {retry_delay_seconds:.0f}s...")
+                                add_log(f"[YouTube] Resumption page_token expired or invalid ({details}); resetting page_token and reconnecting in {error_retry_delay_seconds:.0f}s...")
                                 next_page_token = None
                             else:
                                 add_log(f"[YouTube] Live chat unavailable (INVALID_ARGUMENT): {details}")
                                 return "chat_closed"
                         elif status_code == grpc.StatusCode.RESOURCE_EXHAUSTED:
-                            retry_delay_seconds = max(retry_delay_seconds, 300.0)
-                            add_log(f"[YouTube] Quota/rate exhausted ({status_code.name}): {details}. Pausing reconnect for {retry_delay_seconds:.0f}s...")
+                            error_retry_delay_seconds = max(error_retry_delay_seconds, 300.0)
+                            add_log(f"[YouTube] Quota/rate exhausted ({status_code.name}): {details}. Pausing reconnect for {error_retry_delay_seconds:.0f}s...")
                         else:
-                            # Transient error (e.g. 1-hour stream max duration, UNAVAILABLE, DEADLINE_EXCEEDED, CANCELLED)
-                            add_log(f"[YouTube] gRPC stream disconnected ({status_code.name if status_code else 'Error'}), resuming in {retry_delay_seconds:.0f}s (page_token preserved={bool(next_page_token)})... ({details})")
+                            # Transient error (e.g. UNAVAILABLE, DEADLINE_EXCEEDED, CANCELLED)
+                            add_log(f"[YouTube] gRPC stream disconnected ({status_code.name if status_code else 'Error'}), resuming in {error_retry_delay_seconds:.0f}s (page_token preserved={bool(next_page_token)})... ({details})")
                             if status_code == grpc.StatusCode.UNAVAILABLE:
                                 should_recreate_channel = True
+                        next_wait_seconds = error_retry_delay_seconds
                     finally:
                         active_grpc_call = None
 
-                    if wait_in_thread_for_shutdown(retry_delay_seconds):
+                    if wait_in_thread_for_shutdown(next_wait_seconds):
                         return "shutdown"
-                    retry_delay_seconds = min(retry_delay_seconds * 1.5, 30.0)
+                    if is_error_retry:
+                        error_retry_delay_seconds = min(error_retry_delay_seconds * 1.5, 30.0)
                     if should_recreate_channel:
                         break
 
         except Exception as e:
             if shutdown_event.is_set():
                 return "shutdown"
-            add_log(f"[YouTube] gRPC channel error: {e}, reconnecting in {retry_delay_seconds:.0f}s...")
-            if wait_in_thread_for_shutdown(retry_delay_seconds):
+            add_log(f"[YouTube] gRPC channel error: {e}, reconnecting in {error_retry_delay_seconds:.0f}s...")
+            if wait_in_thread_for_shutdown(error_retry_delay_seconds):
                 return "shutdown"
-            retry_delay_seconds = min(retry_delay_seconds * 1.5, 30.0)
+            error_retry_delay_seconds = min(error_retry_delay_seconds * 1.5, 30.0)
 
     return "shutdown"
 
@@ -870,7 +906,6 @@ async def send_queued_messages_to_bilibili_live_room(chat_message_queue: asyncio
                         rate_limit_waits += 1
                         min_send_interval = min(min_send_interval + 0.5, 3.0)
                         if rate_limit_waits <= max_rate_limit_waits:
-                            add_log(f"Bilibili rate-limit ({e.code}: {err_msg}) for ({message_source_tag}). Waiting {blocked_retry_interval:.0f}s before retry ({rate_limit_waits}/{max_rate_limit_waits})...")
                             await wait_until_timeout_or_shutdown_event(blocked_retry_interval)
                             continue
                         add_log(f"[BLOCKED] Bilibili rate-limit persisted after {max_rate_limit_waits} waits ({message_source_tag}): {chat_message_content}")
@@ -882,7 +917,7 @@ async def send_queued_messages_to_bilibili_live_room(chat_message_queue: asyncio
                         try:
                             refresh_res = await check_and_refresh_bilibili_credentials(force=False)
                             if refresh_res.get("status") in ("ok", "refreshed") and bilibili_live_room:
-                                bilibili_live_room.credential = get_bilibili_credential()
+                                bilibili_live_room.credential = build_bilibili_credential()
                                 continue
                         except Exception as refresh_err:
                             add_log(f"Bilibili credential refresh attempt failed: {refresh_err}")
@@ -1075,8 +1110,8 @@ async def api_bilibili_qrcode_poll(session_id: str):
             try:
                 session.get(url, headers=BILI_HEADERS, timeout=10)
                 cookies_dict.update(session.cookies.get_dict())
-            except Exception as e:
-                add_log(f"CrossDomain ticket fetch notice: {e}")
+            except Exception:
+                pass
 
         return json_data, cookies_dict
 
