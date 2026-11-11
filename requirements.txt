@@ -5,4 +5,3 @@ fastapi
 uvicorn
 grpcio
 grpcio-tools
-curl_cffi

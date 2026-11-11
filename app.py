@@ -3,7 +3,6 @@ import collections
 import re
 import ssl
 import string
-import urllib.request
 import urllib.parse
 import json
 import os
@@ -32,11 +31,6 @@ from bilibili_api import Credential, Danmaku, login_v2
 from bilibili_api.exceptions import NetworkException, ResponseCodeException
 from bilibili_api.utils.network import get_buvid, Api
 from bilibili_api.live import LiveRoom, API as LIVE_API
-
-try:
-    from curl_cffi import requests as curl_requests
-except ImportError:
-    curl_requests = None
 
 app = FastAPI()
 
@@ -168,7 +162,6 @@ active_grpc_call = None
 bilibili_live_room = None
 bilibili_real_room_id = None
 youtube_api_client = None
-last_youtube_playlist_check_time = 0.0
 
 twitch_privmsg_pattern = re.compile(r"^(?:@([^\s]+)\s+)?:(\w+)!.*?PRIVMSG.*? :(.*)$")
 twitch_usernotice_pattern = re.compile(r"^(?:@([^\s]+)\s+)?:tmi\.twitch\.tv\s+USERNOTICE\s+#[^\s]+(?:\s+:(.*))?$")
@@ -270,6 +263,10 @@ channel_id_cache = {}
 
 def get_youtube_channel_id_from_handle(channel_handle):
     clean_handle = channel_handle.strip()
+    if not clean_handle:
+        return None
+    if clean_handle.startswith("UC") and len(clean_handle) == 24:
+        return clean_handle
     if clean_handle in channel_id_cache:
         return channel_id_cache[clean_handle]
 
@@ -344,104 +341,31 @@ def verify_youtube_live_chat_status(video_id):
     return verify_youtube_live_chat_status_batch([video_id])
 
 def get_current_live_video_info_from_youtube_channel(channel_handle):
-    normalized_channel_handle = channel_handle.strip()
-    if not normalized_channel_handle.startswith("@") and not normalized_channel_handle.startswith("UC"):
-        normalized_channel_handle = "@" + normalized_channel_handle
+    """Discover an active or upcoming live stream via official YouTube Data API v3 only (no HTML scraping)."""
+    if not youtube_api_client or not channel_handle:
+        return None
 
-    candidate_video_ids = []
-    encoded_handle = urllib.parse.quote(normalized_channel_handle)
-    youtube_live_url = f"https://www.youtube.com/{encoded_handle}/live"
-    html_content_string = ""
-    final_url = ""
+    try:
+        resolved_channel_id = get_youtube_channel_id_from_handle(channel_handle)
+        if not resolved_channel_id or not resolved_channel_id.startswith("UC"):
+            return None
 
-    # Primary method: Fetch /live using curl_cffi with Chrome TLS fingerprinting
-    if curl_requests is not None:
-        try:
-            resp = curl_requests.get(youtube_live_url, impersonate="chrome", timeout=10)
-            if resp.status_code == 200:
-                html_content_string = resp.text
-                final_url = resp.url
-        except Exception:
-            pass
+        uploads_playlist_id = "UU" + resolved_channel_id[2:]
+        playlist_response = youtube_api_client.playlistItems().list(
+            part="contentDetails",
+            playlistId=uploads_playlist_id,
+            maxResults=10,
+        ).execute()
 
-    # Fallback to urllib with modern browser headers
-    if not html_content_string:
-        try:
-            http_request = urllib.request.Request(
-                youtube_live_url,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Cache-Control': 'no-cache'
-                }
-            )
-            with urllib.request.urlopen(http_request, timeout=10) as http_response:
-                html_content_string = http_response.read().decode('utf-8', errors='ignore')
-                final_url = http_response.geturl()
-        except Exception:
-            pass
-
-    if html_content_string:
-        # Check redirect
-        m_redirect = re.search(r"[?&]v=([a-zA-Z0-9_-]+)", final_url)
-        if m_redirect:
-            candidate_video_ids.append(m_redirect.group(1))
-
-        # Check canonical watch link
-        canonical_link_match = re.search(r'<link rel="canonical" href="https://www.youtube.com/watch\?v=([a-zA-Z0-9_-]+)">', html_content_string)
-        if canonical_link_match:
-            candidate_video_ids.append(canonical_link_match.group(1))
-
-        # Check liveStreamRenderer
-        live_stream_renderer_match = re.search(r'"liveStreamRenderer":\s*\{\s*"videoId":\s*"([a-zA-Z0-9_-]+)"', html_content_string)
-        if live_stream_renderer_match:
-            candidate_video_ids.append(live_stream_renderer_match.group(1))
-
-        # Check videoDetails
-        video_details_match = re.search(r'"videoDetails":\s*\{\s*"videoId":\s*"([a-zA-Z0-9_-]+)"', html_content_string)
-        if video_details_match:
-            candidate_video_ids.append(video_details_match.group(1))
-
-    # Verify candidates scraped from /live page in a single batched API call (cost: 1 quota unit total)
-    seen_candidates = []
-    seen_candidates_set = set()
-    for vid in candidate_video_ids:
-        if vid and vid not in seen_candidates_set:
-            seen_candidates_set.add(vid)
-            seen_candidates.append(vid)
-
-    if seen_candidates:
-        verified = verify_youtube_live_chat_status_batch(seen_candidates)
-        if verified:
-            return verified
-
-    # Secondary method: Check Channel Uploads Playlist at most once every 60s to preserve offline quota
-    global last_youtube_playlist_check_time
-    now = time.monotonic()
-    if now - last_youtube_playlist_check_time >= 60.0:
-        last_youtube_playlist_check_time = now
-        try:
-            resolved_channel_id = get_youtube_channel_id_from_handle(channel_handle)
-            if resolved_channel_id and resolved_channel_id.startswith("UC") and youtube_api_client:
-                uploads_playlist_id = "UU" + resolved_channel_id[2:]
-                playlist_response = youtube_api_client.playlistItems().list(
-                    part="contentDetails",
-                    playlistId=uploads_playlist_id,
-                    maxResults=3,
-                ).execute()
-                playlist_vids = []
-                for item in playlist_response.get("items", []):
-                    vid = item.get("contentDetails", {}).get("videoId")
-                    if vid and vid not in seen_candidates_set:
-                        seen_candidates_set.add(vid)
-                        playlist_vids.append(vid)
-                if playlist_vids:
-                    verified = verify_youtube_live_chat_status_batch(playlist_vids)
-                    if verified:
-                        return verified
-        except Exception:
-            pass
+        playlist_vids = [
+            item.get("contentDetails", {}).get("videoId")
+            for item in playlist_response.get("items", [])
+            if item.get("contentDetails", {}).get("videoId")
+        ]
+        if playlist_vids:
+            return verify_youtube_live_chat_status_batch(playlist_vids)
+    except Exception as e:
+        add_log(f"[YouTube] Error checking channel uploads for live stream: {e}")
 
     return None
 
@@ -680,7 +604,7 @@ async def listen_to_youtube_chat_and_queue_messages(chat_message_queue: asyncio.
                 has_logged_waiting = True
                 last_log_time = now
 
-            await wait_until_timeout_or_shutdown_event(15.0)
+            await wait_until_timeout_or_shutdown_event(30.0)
 
         if shutdown_event.is_set() or not live_info:
             return
