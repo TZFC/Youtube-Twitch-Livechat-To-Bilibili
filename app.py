@@ -6,7 +6,11 @@ import string
 import urllib.parse
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import zipfile
 import datetime
 import grpc
 import requests
@@ -16,7 +20,8 @@ import uuid
 import time
 import qrcode
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, APP_DIR)
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
@@ -34,6 +39,8 @@ from bilibili_api.live import LiveRoom, API as LIVE_API
 
 app = FastAPI()
 
+APP_VERSION = "v2.1.0"
+GITHUB_REPO = "TZFC/Youtube-Twitch-Livechat-To-Bilibili"
 CONFIG_FILE = "config.json"
 
 BILI_HEADERS = {
@@ -986,7 +993,300 @@ def api_get_config():
 
 @app.get("/api/status")
 def api_get_status():
-    return {"running": bridge_task is not None and not bridge_task.done()}
+    return {
+        "running": bridge_task is not None and not bridge_task.done(),
+        "version": get_installed_version(),
+    }
+
+def _parse_semver(tag: str) -> tuple:
+    nums = re.findall(r"\d+", str(tag or ""))
+    if not nums:
+        return (0,)
+    return tuple(int(n) for n in nums)
+
+def _get_version_marker_path(base_dir: str = APP_DIR) -> str:
+    python_dir = os.path.join(base_dir, "python")
+    if os.path.isdir(python_dir):
+        return os.path.join(python_dir, ".installed_version")
+    return os.path.join(base_dir, ".installed_version")
+
+def get_installed_version(base_dir: str = APP_DIR) -> str:
+    best_ver = APP_VERSION
+    marker_path = _get_version_marker_path(base_dir)
+    if os.path.exists(marker_path):
+        try:
+            with open(marker_path, "r", encoding="utf-8") as f:
+                marked = f.read().strip()
+            if marked and _parse_semver(marked) >= _parse_semver(best_ver):
+                best_ver = marked
+        except Exception:
+            pass
+    return best_ver
+
+def fetch_latest_github_release() -> dict:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"Youtube-Twitch-Livechat-To-Bilibili/{APP_VERSION}",
+    }
+    latest_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    resp = requests.get(latest_url, headers=headers, timeout=15)
+    if resp.status_code == 404:
+        list_resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases", headers=headers, timeout=15)
+        list_resp.raise_for_status()
+        releases = list_resp.json()
+        if not releases:
+            raise RuntimeError("No GitHub releases found.")
+        release = releases[0]
+    else:
+        resp.raise_for_status()
+        release = resp.json()
+
+    tag_name = (release.get("tag_name") or "").strip()
+    if not tag_name:
+        raise RuntimeError("Latest GitHub release does not contain a tag_name.")
+
+    download_url = ""
+    for asset in release.get("assets", []):
+        name = (asset.get("name") or "").lower()
+        if name.endswith(".zip") and asset.get("browser_download_url"):
+            download_url = asset["browser_download_url"]
+            break
+    if not download_url:
+        download_url = release.get("zipball_url") or f"https://github.com/{GITHUB_REPO}/archive/refs/tags/{tag_name}.zip"
+
+    return {
+        "tag_name": tag_name,
+        "name": release.get("name") or tag_name,
+        "body": release.get("body") or "",
+        "html_url": release.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/tag/{tag_name}",
+        "download_url": download_url,
+    }
+
+def _is_protected_update_path(rel_path: str) -> bool:
+    norm = rel_path.replace("\\", "/").lstrip("/")
+    if not norm:
+        return True
+    top_segment = norm.split("/", 1)[0]
+    protected_exact = {
+        "config.json",
+        "log.txt",
+        "python",
+        ".git",
+        "__pycache__",
+        ".installed_version",
+        ".venv",
+        ".venv313",
+    }
+    if top_segment in protected_exact:
+        return True
+    if top_segment.startswith("log.") or (top_segment.startswith("twitch_events_") and top_segment.endswith(".log")):
+        return True
+    return False
+
+def _safe_extract_zip(zf: zipfile.ZipFile, dest_dir: str):
+    real_dest = os.path.realpath(dest_dir)
+    for member in zf.infolist():
+        target_path = os.path.realpath(os.path.join(dest_dir, member.filename))
+        if target_path != real_dest and not target_path.startswith(real_dest + os.sep):
+            raise RuntimeError(f"Unsafe zip entry detected: {member.filename}")
+    zf.extractall(dest_dir)
+
+def _sync_dependencies_and_proto(base_dir: str = APP_DIR):
+    python_dir = os.path.join(base_dir, "python")
+    if not os.path.isdir(python_dir):
+        return
+
+    req_file = os.path.join(base_dir, "requirements.txt")
+    req_marker = os.path.join(python_dir, ".requirements.txt")
+    if os.path.exists(req_file):
+        req_changed = not os.path.exists(req_marker)
+        if not req_changed:
+            with open(req_file, "rb") as f1, open(req_marker, "rb") as f2:
+                req_changed = f1.read() != f2.read()
+        if req_changed:
+            res = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_file], cwd=base_dir, capture_output=True, text=True)
+            if res.returncode == 0:
+                shutil.copyfile(req_file, req_marker)
+            else:
+                try:
+                    os.remove(req_marker)
+                except OSError:
+                    pass
+
+    proto_file = os.path.join(base_dir, "stream_list.proto")
+    proto_marker = os.path.join(python_dir, ".stream_list.proto")
+    if os.path.exists(proto_file):
+        proto_changed = not os.path.exists(proto_marker)
+        if not proto_changed:
+            with open(proto_file, "rb") as f1, open(proto_marker, "rb") as f2:
+                proto_changed = f1.read() != f2.read()
+        if proto_changed:
+            res = subprocess.run(
+                [sys.executable, "-m", "grpc_tools.protoc", "-I.", "--python_out=.", "--grpc_python_out=.", "stream_list.proto"],
+                cwd=base_dir,
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode == 0:
+                shutil.copyfile(proto_file, proto_marker)
+            else:
+                try:
+                    os.remove(proto_marker)
+                except OSError:
+                    pass
+
+def apply_github_release_update(base_dir: str = APP_DIR, release_info: dict = None, zip_bytes: bytes = None, sync_deps: bool = True) -> dict:
+    previous_version = get_installed_version(base_dir)
+    if release_info is None:
+        release_info = fetch_latest_github_release()
+
+    latest_tag = release_info["tag_name"]
+    temp_dir = tempfile.mkdtemp(prefix="yt_bili_update_")
+    config_path = os.path.join(base_dir, CONFIG_FILE)
+    config_backup_bytes = None
+    if os.path.exists(config_path):
+        with open(config_path, "rb") as f:
+            config_backup_bytes = f.read()
+
+    try:
+        if zip_bytes is None:
+            headers = {"User-Agent": f"Youtube-Twitch-Livechat-To-Bilibili/{APP_VERSION}"}
+            dl_resp = requests.get(release_info["download_url"], headers=headers, timeout=60, allow_redirects=True)
+            dl_resp.raise_for_status()
+            zip_bytes = dl_resp.content
+
+        zip_path = os.path.join(temp_dir, "release.zip")
+        with open(zip_path, "wb") as f:
+            f.write(zip_bytes)
+
+        extract_dir = os.path.join(temp_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            bad_file = zf.testzip()
+            if bad_file is not None:
+                raise RuntimeError(f"Corrupted file in release archive: {bad_file}")
+            _safe_extract_zip(zf, extract_dir)
+
+        # Unwrap single top-level directory produced by GitHub source zipballs
+        top_entries = os.listdir(extract_dir)
+        source_root = extract_dir
+        if len(top_entries) == 1 and os.path.isdir(os.path.join(extract_dir, top_entries[0])):
+            source_root = os.path.join(extract_dir, top_entries[0])
+
+        updated_files = 0
+        for root, dirs, files in os.walk(source_root):
+            rel_root = os.path.relpath(root, source_root)
+            rel_root = "" if rel_root == "." else rel_root
+            dirs[:] = [d for d in dirs if not _is_protected_update_path(os.path.join(rel_root, d) if rel_root else d)]
+
+            for filename in files:
+                rel_file = os.path.join(rel_root, filename) if rel_root else filename
+                if _is_protected_update_path(rel_file):
+                    continue
+                src_file = os.path.join(root, filename)
+                dst_file = os.path.join(base_dir, rel_file)
+                os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+                shutil.copy2(src_file, dst_file)
+                updated_files += 1
+
+        if config_backup_bytes is not None:
+            with open(config_path, "wb") as f:
+                f.write(config_backup_bytes)
+
+        marker_path = _get_version_marker_path(base_dir)
+        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+        with open(marker_path, "w", encoding="utf-8") as f:
+            f.write(latest_tag)
+
+        if sync_deps:
+            _sync_dependencies_and_proto(base_dir)
+
+        log_path = os.path.join(base_dir, "log.txt")
+        if os.path.exists(log_path):
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("")
+
+        return {
+            "status": "updated",
+            "previous_version": previous_version,
+            "updated_version": latest_tag,
+            "updated_files": updated_files,
+            "config_preserved": True,
+        }
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+def _schedule_self_restart(delay_seconds: float = 0.8):
+    app_entry = os.path.abspath(__file__)
+    helper_code = (
+        "import socket, subprocess, sys, time; "
+        "deadline = time.monotonic() + 15.0; "
+        "time.sleep(1.2); "
+        "\nwhile time.monotonic() < deadline:\n"
+        "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        "    in_use = s.connect_ex(('127.0.0.1', 8000)) == 0\n"
+        "    s.close()\n"
+        "    if not in_use:\n"
+        "        break\n"
+        "    time.sleep(0.3)\n"
+        "flags = getattr(subprocess, 'CREATE_NEW_CONSOLE', 0)\n"
+        "subprocess.Popen([sys.executable, sys.argv[1]], cwd=sys.argv[2], creationflags=flags)\n"
+    )
+
+    def _spawn_and_exit():
+        try:
+            subprocess.Popen([sys.executable, "-c", helper_code, app_entry, APP_DIR], cwd=APP_DIR)
+        except Exception as e:
+            add_log(f"Failed to launch updated process: {e}")
+        os._exit(0)
+
+    asyncio.get_event_loop().call_later(delay_seconds, _spawn_and_exit)
+
+@app.get("/api/update/check")
+async def api_update_check():
+    current_version = get_installed_version()
+    try:
+        release_info = await asyncio.to_thread(fetch_latest_github_release)
+        latest_version = release_info["tag_name"]
+        update_available = _parse_semver(latest_version) > _parse_semver(current_version)
+        return {
+            "status": "ok",
+            "current_version": current_version,
+            "latest_version": latest_version,
+            "update_available": update_available,
+            "release_name": release_info["name"],
+            "release_notes": release_info["body"],
+            "html_url": release_info["html_url"],
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "current_version": current_version,
+            "latest_version": current_version,
+            "update_available": False,
+            "message": str(e),
+        }
+
+@app.post("/api/update")
+async def api_perform_update():
+    global shutdown_event, bridge_task
+    if bridge_task and not bridge_task.done():
+        if shutdown_event:
+            shutdown_event.set()
+        cancel_active_grpc_stream()
+        add_log("Stopping bridge tasks for application update...")
+        await bridge_task
+        bridge_task = None
+
+    try:
+        result = await asyncio.to_thread(apply_github_release_update)
+        add_log(f"Updated application from {result['previous_version']} to {result['updated_version']} (config.json preserved). Restarting...")
+        _schedule_self_restart(delay_seconds=0.8)
+        result["restarting"] = True
+        return result
+    except Exception as e:
+        add_log(f"Update failed: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.on_event("startup")
 async def on_startup():

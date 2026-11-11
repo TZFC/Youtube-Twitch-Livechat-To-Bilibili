@@ -261,6 +261,21 @@
         .bili-btn.secondary-btn:hover {
             background-color: #494c4f;
         }
+        .bili-btn.update-available-btn {
+            background-color: var(--btn-green);
+        }
+        .bili-btn.update-available-btn:hover {
+            background-color: #187a34;
+        }
+        .update-release-link {
+            font-size: 12px;
+            color: #1a73e8;
+            text-decoration: none;
+            margin-left: 6px;
+        }
+        .update-release-link:hover {
+            text-decoration: underline;
+        }
 
         /* Collapsible Advanced Section */
         .advanced-cookie-details {
@@ -363,6 +378,20 @@
 
 <div class="container">
     <h2>Chat Bridge Settings</h2>
+
+    <div class="bili-auth-card" id="appUpdateCard">
+        <div class="bili-auth-header">
+            <div class="bili-status-indicator">
+                <span id="updateStatusDot" class="status-dot"></span>
+                <span id="updateStatusText">Version: checking...</span>
+                <a id="updateReleaseLink" class="update-release-link" href="#" target="_blank" rel="noopener noreferrer" style="display: none;">Release Notes</a>
+            </div>
+            <div class="bili-auth-actions">
+                <button type="button" id="checkUpdateBtn" class="bili-btn secondary-btn" onclick="checkForUpdates(true)">🔍 Check</button>
+                <button type="button" id="updateAppBtn" class="bili-btn primary-btn" onclick="triggerAppUpdate()">⬆️ Update</button>
+            </div>
+        </div>
+    </div>
 
     <form id="configForm">
         <div class="section-title">General Settings</div>
@@ -519,6 +548,137 @@
 
     let qrPollInterval = null;
     let activeQrSessionId = null;
+    let isUpdatingApp = false;
+    let latestUpdateAvailable = false;
+    let latestReleaseTag = '';
+
+    async function checkForUpdates(manual = false) {
+        const dot = document.getElementById('updateStatusDot');
+        const text = document.getElementById('updateStatusText');
+        const link = document.getElementById('updateReleaseLink');
+        const checkBtn = document.getElementById('checkUpdateBtn');
+        const updateBtn = document.getElementById('updateAppBtn');
+
+        if (manual) {
+            checkBtn.disabled = true;
+            checkBtn.textContent = 'Checking...';
+        }
+        try {
+            const res = await fetch('/api/update/check');
+            const data = await res.json();
+            if (data.status === 'ok') {
+                latestUpdateAvailable = !!data.update_available;
+                latestReleaseTag = data.latest_version || '';
+                if (data.html_url) {
+                    link.href = data.html_url;
+                    link.style.display = 'inline';
+                }
+                if (data.update_available) {
+                    dot.className = 'status-dot yellow';
+                    text.textContent = `Current: ${data.current_version} -> New: ${data.latest_version}`;
+                    updateBtn.className = 'bili-btn update-available-btn';
+                    updateBtn.textContent = `⬆️ Update (${data.latest_version})`;
+                } else {
+                    dot.className = 'status-dot green';
+                    text.textContent = `Version: ${data.current_version} (Up to date)`;
+                    updateBtn.className = 'bili-btn primary-btn';
+                    updateBtn.textContent = '⬆️ Update';
+                }
+            } else {
+                dot.className = 'status-dot';
+                text.textContent = `Version: ${data.current_version || 'unknown'} (Check failed)`;
+                if (manual && data.message) {
+                    alert('Failed to check updates: ' + data.message);
+                }
+            }
+        } catch (e) {
+            console.error('Update check failed', e);
+            dot.className = 'status-dot';
+            text.textContent = 'Update check error';
+            if (manual) {
+                alert('Failed to check updates: ' + e.message);
+            }
+        } finally {
+            if (manual) {
+                checkBtn.disabled = false;
+                checkBtn.textContent = '🔍 Check';
+            }
+        }
+    }
+
+    async function waitForRestartAndReload(expectedVersion) {
+        const text = document.getElementById('updateStatusText');
+        const deadline = Date.now() + 30000;
+        // Wait briefly for old server to shut down before polling restarted instance
+        await new Promise(r => setTimeout(r, 1500));
+        while (Date.now() < deadline) {
+            try {
+                const res = await fetch('/api/status', { cache: 'no-store' });
+                if (res.ok) {
+                    const data = await res.json();
+                    text.textContent = `Restarted (${data.version || expectedVersion}). Reloading...`;
+                    window.location.reload();
+                    return;
+                }
+            } catch (_) {
+                // Server still restarting
+            }
+            await new Promise(r => setTimeout(r, 800));
+        }
+        alert('Update installed and config.json preserved, but auto-reconnect timed out. Please refresh or run run.bat.');
+        isUpdatingApp = false;
+    }
+
+    async function triggerAppUpdate() {
+        const updateBtn = document.getElementById('updateAppBtn');
+        const checkBtn = document.getElementById('checkUpdateBtn');
+        const dot = document.getElementById('updateStatusDot');
+        const text = document.getElementById('updateStatusText');
+
+        if (!latestUpdateAvailable) {
+            const proceed = confirm(
+                `You appear to be on the latest version${latestReleaseTag ? ' (' + latestReleaseTag + ')' : ''}.\nDownload and reinstall the latest release anyway? Your config.json will be kept.`
+            );
+            if (!proceed) return;
+        }
+
+        updateBtn.disabled = true;
+        checkBtn.disabled = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = true;
+        dot.className = 'status-dot yellow';
+        text.textContent = 'Downloading & applying update (keeping config.json)...';
+        updateBtn.textContent = 'Updating...';
+        isUpdatingApp = true;
+
+        try {
+            const res = await fetch('/api/update', { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'updated') {
+                dot.className = 'status-dot green';
+                text.textContent = `Updated to ${data.updated_version}. Restarting server...`;
+                await waitForRestartAndReload(data.updated_version);
+            } else {
+                isUpdatingApp = false;
+                dot.className = 'status-dot red';
+                text.textContent = 'Update failed (config preserved)';
+                alert('Update failed: ' + (data.message || 'Unknown error'));
+                updateBtn.disabled = false;
+                checkBtn.disabled = false;
+                updateBtn.textContent = latestUpdateAvailable && latestReleaseTag ? `⬆️ Update (${latestReleaseTag})` : '⬆️ Update';
+                await checkStatus();
+            }
+        } catch (e) {
+            isUpdatingApp = false;
+            dot.className = 'status-dot red';
+            text.textContent = 'Update error (config preserved)';
+            alert('Update error: ' + e.message);
+            updateBtn.disabled = false;
+            checkBtn.disabled = false;
+            updateBtn.textContent = '⬆️ Update';
+            await checkStatus();
+        }
+    }
 
     async function checkBilibiliStatus() {
         const dot = document.getElementById('biliStatusDot');
@@ -735,9 +895,11 @@
         }
     });
 
-    // Handle tab close (graceful shutdown)
+    // Handle tab close (graceful shutdown unless reloading after update)
     window.addEventListener('beforeunload', () => {
-        navigator.sendBeacon('/api/shutdown');
+        if (!isUpdatingApp) {
+            navigator.sendBeacon('/api/shutdown');
+        }
     });
 
     async function updateLogs() {
@@ -762,6 +924,7 @@
     loadConfig().then(() => {
         checkStatus();
         checkBilibiliStatus();
+        checkForUpdates(false);
     });
     updateLogs();
     
