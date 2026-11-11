@@ -29,8 +29,9 @@ import stream_list_pb2_grpc
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from bilibili_api import Credential, Danmaku, login_v2
-from bilibili_api.utils.network import get_buvid
-from bilibili_api.live import LiveRoom
+from bilibili_api.exceptions import NetworkException, ResponseCodeException
+from bilibili_api.utils.network import get_buvid, Api
+from bilibili_api.live import LiveRoom, API as LIVE_API
 
 try:
     from curl_cffi import requests as curl_requests
@@ -162,10 +163,12 @@ def add_log(msg: str):
 # Global state
 shutdown_event = None
 bridge_task = None
+active_grpc_call = None
 
 bilibili_live_room = None
 bilibili_real_room_id = None
 youtube_api_client = None
+last_youtube_playlist_check_time = 0.0
 
 twitch_privmsg_pattern = re.compile(r"^(?:@([^\s]+)\s+)?:(\w+)!.*?PRIVMSG.*? :(.*)$")
 twitch_usernotice_pattern = re.compile(r"^(?:@([^\s]+)\s+)?:tmi\.twitch\.tv\s+USERNOTICE\s+#[^\s]+(?:\s+:(.*))?$")
@@ -297,36 +300,48 @@ def get_youtube_channel_id_from_handle(channel_handle):
         add_log(f"Error resolving YouTube channel handle: {e}")
         return None
 
-def verify_youtube_live_chat_status(video_id):
-    if not video_id or not youtube_api_client:
+def _parse_youtube_live_chat_item(item):
+    video_id = item.get("id")
+    snippet = item.get("snippet", {})
+    details = item.get("liveStreamingDetails", {})
+
+    broadcast_content = snippet.get("liveBroadcastContent", "none")
+    active_live_chat_id = details.get("activeLiveChatId")
+    actual_end_time = details.get("actualEndTime")
+
+    # Must be an active or upcoming broadcast with an available live chat ID and not already ended
+    if broadcast_content in ("live", "upcoming") and active_live_chat_id and not actual_end_time:
+        return {
+            "video_id": video_id,
+            "title": snippet.get("title", ""),
+            "chat_id": active_live_chat_id,
+            "status": broadcast_content
+        }
+    return None
+
+def verify_youtube_live_chat_status_batch(video_ids):
+    unique_ids = [vid for vid in dict.fromkeys(video_ids) if vid]
+    if not unique_ids or not youtube_api_client:
         return None
     try:
         res = youtube_api_client.videos().list(
             part="snippet,liveStreamingDetails",
-            id=video_id,
+            id=",".join(unique_ids[:50]),
         ).execute()
-        items = res.get("items", [])
-        if not items:
-            return None
-        item = items[0]
-        snippet = item.get("snippet", {})
-        details = item.get("liveStreamingDetails", {})
-
-        broadcast_content = snippet.get("liveBroadcastContent", "none")
-        active_live_chat_id = details.get("activeLiveChatId")
-        actual_end_time = details.get("actualEndTime")
-
-        # Must be an active or upcoming broadcast with an available live chat ID and not already ended
-        if broadcast_content in ("live", "upcoming") and active_live_chat_id and not actual_end_time:
-            return {
-                "video_id": video_id,
-                "title": snippet.get("title", ""),
-                "chat_id": active_live_chat_id,
-                "status": broadcast_content
-            }
+        items_by_id = {item.get("id"): item for item in res.get("items", []) if item.get("id")}
+        for vid in unique_ids:
+            item = items_by_id.get(vid)
+            if not item:
+                continue
+            verified = _parse_youtube_live_chat_item(item)
+            if verified:
+                return verified
     except Exception as e:
-        add_log(f"Error checking YouTube video {video_id} live status: {e}")
+        add_log(f"Error checking YouTube videos {unique_ids} live status: {e}")
     return None
+
+def verify_youtube_live_chat_status(video_id):
+    return verify_youtube_live_chat_status_batch([video_id])
 
 def get_current_live_video_info_from_youtube_channel(channel_handle):
     normalized_channel_handle = channel_handle.strip()
@@ -388,38 +403,60 @@ def get_current_live_video_info_from_youtube_channel(channel_handle):
         if video_details_match:
             candidate_video_ids.append(video_details_match.group(1))
 
-    # Verify candidates scraped from /live page
-    seen_candidates = set()
+    # Verify candidates scraped from /live page in a single batched API call (cost: 1 quota unit total)
+    seen_candidates = []
+    seen_candidates_set = set()
     for vid in candidate_video_ids:
-        if vid and vid not in seen_candidates:
-            seen_candidates.add(vid)
-            verified = verify_youtube_live_chat_status(vid)
-            if verified:
-                return verified
+        if vid and vid not in seen_candidates_set:
+            seen_candidates_set.add(vid)
+            seen_candidates.append(vid)
 
-    # Secondary method: Check Channel Uploads Playlist (cost: 1 quota unit for playlist + 1 unit for video verification)
-    try:
-        resolved_channel_id = get_youtube_channel_id_from_handle(channel_handle)
-        if resolved_channel_id and resolved_channel_id.startswith("UC") and youtube_api_client:
-            uploads_playlist_id = "UU" + resolved_channel_id[2:]
-            playlist_response = youtube_api_client.playlistItems().list(
-                part="contentDetails",
-                playlistId=uploads_playlist_id,
-                maxResults=3,
-            ).execute()
-            for item in playlist_response.get("items", []):
-                vid = item.get("contentDetails", {}).get("videoId")
-                if vid and vid not in seen_candidates:
-                    seen_candidates.add(vid)
-                    verified = verify_youtube_live_chat_status(vid)
+    if seen_candidates:
+        verified = verify_youtube_live_chat_status_batch(seen_candidates)
+        if verified:
+            return verified
+
+    # Secondary method: Check Channel Uploads Playlist at most once every 60s to preserve offline quota
+    global last_youtube_playlist_check_time
+    now = time.monotonic()
+    if now - last_youtube_playlist_check_time >= 60.0:
+        last_youtube_playlist_check_time = now
+        try:
+            resolved_channel_id = get_youtube_channel_id_from_handle(channel_handle)
+            if resolved_channel_id and resolved_channel_id.startswith("UC") and youtube_api_client:
+                uploads_playlist_id = "UU" + resolved_channel_id[2:]
+                playlist_response = youtube_api_client.playlistItems().list(
+                    part="contentDetails",
+                    playlistId=uploads_playlist_id,
+                    maxResults=3,
+                ).execute()
+                playlist_vids = []
+                for item in playlist_response.get("items", []):
+                    vid = item.get("contentDetails", {}).get("videoId")
+                    if vid and vid not in seen_candidates_set:
+                        seen_candidates_set.add(vid)
+                        playlist_vids.append(vid)
+                if playlist_vids:
+                    verified = verify_youtube_live_chat_status_batch(playlist_vids)
                     if verified:
                         return verified
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     return None
 
+def wait_in_thread_for_shutdown(timeout_seconds):
+    """Sleep up to timeout_seconds while checking asyncio.Event shutdown_event thread-safely."""
+    deadline = time.monotonic() + timeout_seconds
+    while not shutdown_event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.25, remaining))
+    return True
+
 def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_queue, main_loop):
+    global active_grpc_call
     creds = grpc.ssl_channel_credentials()
     grpc_channel_options = [
         ("grpc.keepalive_time_ms", 30000),
@@ -437,12 +474,21 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
     previously_seen_message_ids_queue = collections.deque(maxlen=3000)
     retry_delay_seconds = 2.0
 
+    def track_seen_message_id(msg_id):
+        if not msg_id or msg_id in previously_seen_message_ids_set:
+            return False
+        if len(previously_seen_message_ids_queue) == 3000:
+            oldest_tracked_message_id = previously_seen_message_ids_queue.popleft()
+            previously_seen_message_ids_set.discard(oldest_tracked_message_id)
+        previously_seen_message_ids_queue.append(msg_id)
+        previously_seen_message_ids_set.add(msg_id)
+        return True
+
     def enqueue_msg(tag, msg):
-        if not msg:
+        if not msg or shutdown_event.is_set():
             return
         try:
-            future = asyncio.run_coroutine_threadsafe(chat_message_queue.put((tag, msg)), main_loop)
-            future.result(timeout=5.0)
+            main_loop.call_soon_threadsafe(chat_message_queue.put_nowait, (tag, msg))
         except Exception as e:
             add_log(f"Failed to queue YouTube message: {e}")
 
@@ -452,42 +498,37 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
                 stub = stream_list_pb2_grpc.V3DataLiveChatMessageServiceStub(channel)
 
                 while not shutdown_event.is_set():
-                    request = stream_list_pb2.LiveChatMessageListRequest(
-                        part=["id", "snippet", "authorDetails"],
-                        live_chat_id=active_live_chat_id,
-                        max_results=200,
-                        page_token=next_page_token,
-                    )
+                    request_kwargs = {
+                        "part": ["id", "snippet", "authorDetails"],
+                        "live_chat_id": active_live_chat_id,
+                        "max_results": 200,
+                    }
+                    if next_page_token:
+                        request_kwargs["page_token"] = next_page_token
+                    request = stream_list_pb2.LiveChatMessageListRequest(**request_kwargs)
 
+                    should_recreate_channel = False
                     try:
-                        for response in stub.StreamList(request, metadata=metadata):
+                        stream_call = stub.StreamList(request, metadata=metadata)
+                        active_grpc_call = stream_call
+                        for response in stream_call:
                             if shutdown_event.is_set():
                                 return "shutdown"
 
-                            retry_delay_seconds = 2.0  # Reset backoff on receiving messages
+                            retry_delay_seconds = 2.0  # Reset backoff on receiving payloads
 
                             if is_initial_chat_poll:
                                 for item in response.items:
-                                    msg_id = item.id
-                                    if msg_id and msg_id not in previously_seen_message_ids_set:
-                                        previously_seen_message_ids_queue.append(msg_id)
-                                        previously_seen_message_ids_set.add(msg_id)
+                                    track_seen_message_id(item.id)
                                 is_initial_chat_poll = False
-                                next_page_token = response.next_page_token
+                                if response.next_page_token:
+                                    next_page_token = response.next_page_token
                                 continue
 
                             has_live_stream_ended = False
                             for item in response.items:
-                                msg_id = item.id
-                                if not msg_id or msg_id in previously_seen_message_ids_set:
+                                if not track_seen_message_id(item.id):
                                     continue
-
-                                if len(previously_seen_message_ids_queue) == 3000:
-                                    oldest_tracked_message_id = previously_seen_message_ids_queue.popleft()
-                                    previously_seen_message_ids_set.discard(oldest_tracked_message_id)
-
-                                previously_seen_message_ids_queue.append(msg_id)
-                                previously_seen_message_ids_set.add(msg_id)
 
                                 event_type = item.snippet.type
 
@@ -552,13 +593,16 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
                                     formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
                                     enqueue_msg("[YT]", formatted_msg)
 
+                            if response.next_page_token:
+                                next_page_token = response.next_page_token
+
                             if has_live_stream_ended:
                                 add_log("[YouTube] Stream ended event received from chat.")
                                 return "stream_ended"
 
-                            next_page_token = response.next_page_token
-                            if not next_page_token:
-                                break
+                        if shutdown_event.is_set():
+                            return "shutdown"
+                        add_log(f"[YouTube] gRPC stream ended cleanly, resuming in {retry_delay_seconds:.0f}s (page_token preserved={bool(next_page_token)})...")
 
                     except grpc.RpcError as rpc_error:
                         if shutdown_event.is_set():
@@ -567,23 +611,41 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
                         status_code = rpc_error.code()
                         details = rpc_error.details() or ""
 
-                        # If chat is ended, closed or not found
-                        if status_code in (grpc.StatusCode.NOT_FOUND, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.INVALID_ARGUMENT):
+                        if status_code in (grpc.StatusCode.NOT_FOUND, grpc.StatusCode.FAILED_PRECONDITION):
                             add_log(f"[YouTube] Live chat ended or unavailable ({status_code.name}): {details}")
                             return "chat_closed"
 
-                        # Transient error (e.g. 1-hour stream max duration, UNAVAILABLE, DEADLINE_EXCEEDED, CANCELLED)
-                        add_log(f"[YouTube] gRPC stream disconnected ({status_code.name if status_code else 'Error'}), reconnecting in {retry_delay_seconds:.0f}s... ({details})")
+                        if status_code == grpc.StatusCode.INVALID_ARGUMENT:
+                            if next_page_token:
+                                add_log(f"[YouTube] Resumption page_token expired or invalid ({details}); resetting page_token and reconnecting in {retry_delay_seconds:.0f}s...")
+                                next_page_token = None
+                            else:
+                                add_log(f"[YouTube] Live chat unavailable (INVALID_ARGUMENT): {details}")
+                                return "chat_closed"
+                        elif status_code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                            retry_delay_seconds = max(retry_delay_seconds, 300.0)
+                            add_log(f"[YouTube] Quota/rate exhausted ({status_code.name}): {details}. Pausing reconnect for {retry_delay_seconds:.0f}s...")
+                        else:
+                            # Transient error (e.g. 1-hour stream max duration, UNAVAILABLE, DEADLINE_EXCEEDED, CANCELLED)
+                            add_log(f"[YouTube] gRPC stream disconnected ({status_code.name if status_code else 'Error'}), resuming in {retry_delay_seconds:.0f}s (page_token preserved={bool(next_page_token)})... ({details})")
+                            if status_code == grpc.StatusCode.UNAVAILABLE:
+                                should_recreate_channel = True
+                    finally:
+                        active_grpc_call = None
+
+                    if wait_in_thread_for_shutdown(retry_delay_seconds):
+                        return "shutdown"
+                    retry_delay_seconds = min(retry_delay_seconds * 1.5, 30.0)
+                    if should_recreate_channel:
                         break
 
         except Exception as e:
             if shutdown_event.is_set():
                 return "shutdown"
             add_log(f"[YouTube] gRPC channel error: {e}, reconnecting in {retry_delay_seconds:.0f}s...")
-
-        if shutdown_event.wait(timeout=retry_delay_seconds):
-            return "shutdown"
-        retry_delay_seconds = min(retry_delay_seconds * 1.5, 30.0)
+            if wait_in_thread_for_shutdown(retry_delay_seconds):
+                return "shutdown"
+            retry_delay_seconds = min(retry_delay_seconds * 1.5, 30.0)
 
     return "shutdown"
 
@@ -747,67 +809,194 @@ async def listen_to_twitch_chat_and_queue_messages(chat_message_queue: asyncio.Q
                 except Exception:
                     pass
 
+def parse_bilibili_censor_result(raw_resp, fallback_text=""):
+    """Inspect Bilibili /msg/send JSON response for censorship ('f' = platform, 'k' = room/streamer)."""
+    if not isinstance(raw_resp, dict):
+        return False, None, None
+
+    msg_flag = raw_resp.get("msg")
+    message_flag = raw_resp.get("message")
+    censor_code = None
+    if msg_flag in ("f", "k"):
+        censor_code = msg_flag
+    elif message_flag in ("f", "k"):
+        censor_code = message_flag
+
+    if not censor_code:
+        return False, None, None
+
+    censor_scope = "platform/system (msg='f')" if censor_code == "f" else "streamer/room keyword (msg='k')"
+    censored_content = fallback_text
+
+    data = raw_resp.get("data")
+    if isinstance(data, dict):
+        mode_info = data.get("mode_info")
+        if isinstance(mode_info, dict):
+            extra_raw = mode_info.get("extra")
+            if isinstance(extra_raw, str) and extra_raw:
+                try:
+                    extra_json = json.loads(extra_raw)
+                    if isinstance(extra_json, dict) and extra_json.get("content"):
+                        censored_content = extra_json["content"]
+                except Exception:
+                    pass
+            elif isinstance(extra_raw, dict) and extra_raw.get("content"):
+                censored_content = extra_raw["content"]
+
+    return True, censor_scope, censored_content
+
+async def send_bilibili_danmaku_raw(room, text, room_id=None):
+    """Send danmaku and return full raw JSON response (preserving msg/message for censor checks)."""
+    room.credential.raise_for_no_sessdata()
+    target_room_id = room_id if room_id else (await room.get_room_play_info())["room_id"]
+    danmaku = Danmaku(text)
+    data = {
+        "mode": danmaku.mode,
+        "msg": danmaku.text,
+        "roomid": target_room_id,
+        "bubble": 0,
+        "rnd": int(time.time()),
+        "color": int(danmaku.color, 16),
+        "fontsize": danmaku.font_size,
+    }
+    resp_data = await Api(**LIVE_API["operate"]["send_danmaku"], credential=room.credential).update_data(**data).request(raw=True)
+    if isinstance(resp_data, dict):
+        code = resp_data.get("code")
+        if code is None:
+            raise ResponseCodeException(-1, "API returned payload without code field", resp_data)
+        if code != 0:
+            msg = resp_data.get("msg")
+            if msg is None:
+                msg = resp_data.get("message")
+            if msg is None:
+                msg = "API error"
+            raise ResponseCodeException(code, msg, resp_data)
+    return resp_data
+
 async def send_queued_messages_to_bilibili_live_room(chat_message_queue: asyncio.Queue):
     global bilibili_real_room_id
+    max_blocked_retries = 3
+    blocked_retry_interval = 3.0
+    max_rate_limit_waits = 30
+    min_send_interval = 1.1
+    last_send_time = 0.0
+
     while not shutdown_event.is_set() or not chat_message_queue.empty():
         try:
             message_source_tag, chat_message_content = await asyncio.wait_for(chat_message_queue.get(), timeout=1.0)
         except asyncio.TimeoutError:
             continue
 
-        if not bilibili_live_room:
-            chat_message_queue.task_done()
-            continue
+        try:
+            if not bilibili_live_room:
+                continue
 
-        # Cache real room_id once to avoid redundant get_room_play_info HTTP calls on every message
-        if bilibili_real_room_id is None and bilibili_live_room:
-            try:
-                room_info = await bilibili_live_room.get_room_play_info()
-                bilibili_real_room_id = room_info.get("room_id")
-            except Exception as e:
-                add_log(f"Warning: Could not get Bilibili real room id: {e}")
-                bilibili_real_room_id = int(config.get("BILIBILI_ROOM_ID", 0))
+            # Cache real room_id once to avoid redundant get_room_play_info HTTP calls on every message
+            if bilibili_real_room_id is None and bilibili_live_room:
+                try:
+                    room_info = await bilibili_live_room.get_room_play_info()
+                    bilibili_real_room_id = room_info.get("room_id")
+                except Exception as e:
+                    add_log(f"Warning: Could not get Bilibili real room id: {e}")
+                    bilibili_real_room_id = int(config.get("BILIBILI_ROOM_ID", 0))
 
-        target_room_id = bilibili_real_room_id if bilibili_real_room_id else None
-        max_retries = 3
-        send_success = False
+            target_room_id = bilibili_real_room_id if bilibili_real_room_id else None
+            blocked_retries_used = 0
+            rate_limit_waits = 0
+            refreshed_session = False
 
-        for attempt in range(max_retries + 1):
-            if shutdown_event.is_set():
-                break
+            while not shutdown_event.is_set():
+                # Enforce spacing before each attempt without adding unnecessary delay when queue was idle
+                elapsed = time.monotonic() - last_send_time
+                if last_send_time > 0 and elapsed < min_send_interval:
+                    await wait_until_timeout_or_shutdown_event(min_send_interval - elapsed)
+                    if shutdown_event.is_set():
+                        break
 
-            try:
-                await bilibili_live_room.send_danmaku(
-                    Danmaku(chat_message_content),
-                    room_id=target_room_id
-                )
-                send_success = True
-                break
-            except Exception as e:
-                if attempt < max_retries:
-                    add_log(f"Bilibili send error ({message_source_tag}): {e}. Retrying ({attempt + 1}/{max_retries}) in 1s...")
-                    await wait_until_timeout_or_shutdown_event(1.0)
+                blocked_error_desc = None
+                try:
+                    raw_resp = await send_bilibili_danmaku_raw(
+                        bilibili_live_room,
+                        chat_message_content,
+                        room_id=target_room_id
+                    )
+                    last_send_time = time.monotonic()
+
+                    is_censored, censor_scope, censored_content = parse_bilibili_censor_result(raw_resp, chat_message_content)
+                    if is_censored:
+                        add_log(f"[CENSORED] Bilibili danmaku censored by {censor_scope} ({message_source_tag}): {censored_content}")
+                        break
+
+                    # Sent and accepted cleanly (not censored): done (exactly once)
+                    break
+
+                except ResponseCodeException as e:
+                    raw_err = e.raw if isinstance(e.raw, dict) else {}
+                    is_censored, censor_scope, censored_content = parse_bilibili_censor_result(raw_err, chat_message_content)
+                    if is_censored:
+                        add_log(f"[CENSORED] Bilibili danmaku censored by {censor_scope} ({message_source_tag}): {censored_content}")
+                        break
+
+                    err_msg = e.msg or str(e)
+                    is_rate_limited = (
+                        e.code in (10030, 10031)
+                        or (("频率" in err_msg or "过快" in err_msg) and "风险" not in err_msg)
+                    )
+                    if is_rate_limited:
+                        rate_limit_waits += 1
+                        min_send_interval = min(min_send_interval + 0.5, 3.0)
+                        if rate_limit_waits <= max_rate_limit_waits:
+                            add_log(f"Bilibili rate-limit ({e.code}: {err_msg}) for ({message_source_tag}). Waiting {blocked_retry_interval:.0f}s before retry ({rate_limit_waits}/{max_rate_limit_waits})...")
+                            await wait_until_timeout_or_shutdown_event(blocked_retry_interval)
+                            continue
+                        add_log(f"[BLOCKED] Bilibili rate-limit persisted after {max_rate_limit_waits} waits ({message_source_tag}): {chat_message_content}")
+                        break
+
+                    if e.code == -101 and not refreshed_session:
+                        refreshed_session = True
+                        add_log("Bilibili returned -101 during danmaku send; checking credential refresh...")
+                        try:
+                            refresh_res = await check_and_refresh_bilibili_credentials(force=False)
+                            if refresh_res.get("status") in ("ok", "refreshed") and bilibili_live_room:
+                                bilibili_live_room.credential = get_bilibili_credential()
+                                continue
+                        except Exception as refresh_err:
+                            add_log(f"Bilibili credential refresh attempt failed: {refresh_err}")
+
+                    blocked_error_desc = f"Bilibili API error: {e}"
+
+                except NetworkException as e:
+                    blocked_error_desc = f"Bilibili non-200 HTTP response: {e}"
+
+                except Exception as e:
+                    blocked_error_desc = f"Bilibili send error: {e}"
+
+                blocked_retries_used += 1
+                if blocked_retries_used <= max_blocked_retries:
+                    add_log(f"{blocked_error_desc} ({message_source_tag}). Retrying ({blocked_retries_used}/{max_blocked_retries}) in {blocked_retry_interval:.0f}s...")
+                    await wait_until_timeout_or_shutdown_event(blocked_retry_interval)
                 else:
-                    add_log(f"Bilibili send error ({message_source_tag}): {e}. Dropping message after {max_retries} retries: {chat_message_content}")
-
-        chat_message_queue.task_done()
-
-        if send_success:
-            # Maintain 1 second spacing between successfully delivered messages to respect Bilibili danmaku rate limits
-            await wait_until_timeout_or_shutdown_event(1.0)
+                    add_log(f"[BLOCKED] Bilibili message still blocked after {max_blocked_retries} retries ({message_source_tag}): {chat_message_content} | Error: {blocked_error_desc}")
+                    break
+        finally:
+            chat_message_queue.task_done()
 
 async def run_youtube_and_twitch_to_bilibili_chat_bridge():
     bridge_message_queue = asyncio.Queue()
 
     try:
-        await asyncio.gather(
+        results = await asyncio.gather(
             listen_to_youtube_chat_and_queue_messages(bridge_message_queue, config.get("YOUTUBE_CHANNEL_HANDLE", "")),
             listen_to_twitch_chat_and_queue_messages(bridge_message_queue),
             send_queued_messages_to_bilibili_live_room(bridge_message_queue),
             return_exceptions=True
         )
-    except Exception:
-        pass
+        task_names = ("YouTube listener", "Twitch listener", "Bilibili sender")
+        for task_name, res in zip(task_names, results):
+            if isinstance(res, Exception):
+                add_log(f"{task_name} stopped with unexpected error: {res}")
+    except Exception as e:
+        add_log(f"Bridge runner error: {e}")
 
 
 # ---- API Endpoints ----
@@ -1075,11 +1264,21 @@ async def api_start():
     bridge_task = asyncio.create_task(run_youtube_and_twitch_to_bilibili_chat_bridge())
     return {"status": "started"}
 
+def cancel_active_grpc_stream():
+    global active_grpc_call
+    call = active_grpc_call
+    if call is not None:
+        try:
+            call.cancel()
+        except Exception:
+            pass
+
 @app.post("/api/stop")
 async def api_stop():
     global shutdown_event, bridge_task
     if shutdown_event:
         shutdown_event.set()
+    cancel_active_grpc_stream()
     if bridge_task:
         add_log("Stopping bridge tasks...")
         await bridge_task
@@ -1092,6 +1291,7 @@ async def api_shutdown():
     global shutdown_event
     if shutdown_event:
         shutdown_event.set()
+    cancel_active_grpc_stream()
     
     def exit_server():
         os._exit(0)
