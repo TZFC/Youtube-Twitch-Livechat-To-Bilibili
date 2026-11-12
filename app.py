@@ -462,6 +462,143 @@ def _get_youtube_poll_backoff_settings():
         max_delay = max(base_delay, 30.0)
     return base_delay, multiplier, max_delay
 
+def format_youtube_live_chat_item(item):
+    """Format a protobuf LiveChatMessage into a Bilibili-ready message, or None if skipped."""
+    event_type = item.snippet.type
+    type_enum = stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.Type
+    author_display_name = item.author_details.display_name if item.HasField("author_details") else "unknown"
+    lang = config.get("OUTPUT_LANGUAGE", "en")
+
+    if event_type == type_enum.TEXT_MESSAGE_EVENT:
+        if item.snippet.HasField("text_message_details"):
+            raw_text = item.snippet.text_message_details.message_text
+        elif item.snippet.HasField("display_message"):
+            raw_text = item.snippet.display_message
+        else:
+            return None
+
+        cleaned_chat = clean_whitespace_and_youtube_emotes_from_message(raw_text)
+        if is_text_empty_or_only_punctuation(cleaned_chat):
+            return None
+        return format_message_with_username_and_truncate(cleaned_chat, author_display_name, "@")
+
+    if event_type == type_enum.GIFT_EVENT:
+        gift_name = ""
+        if item.snippet.HasField("gift_details"):
+            details = item.snippet.gift_details
+            raw_name = (details.gift_name if details.HasField("gift_name") else "") or (
+                details.alt_text if details.HasField("alt_text") else ""
+            )
+            gift_name = clean_whitespace_from_message(raw_name)
+        if not gift_name and item.snippet.HasField("display_message"):
+            gift_name = clean_whitespace_from_message(item.snippet.display_message)
+        if not gift_name:
+            gift_name = "礼物"
+        return format_message_with_username_and_truncate(f"赠送了{gift_name}", author_display_name, "@")
+
+    if event_type == type_enum.SUPER_CHAT_EVENT:
+        if not item.snippet.HasField("super_chat_details"):
+            if item.snippet.HasField("display_message"):
+                fallback = clean_whitespace_from_message(item.snippet.display_message)
+                return format_message_with_username_and_truncate(fallback, author_display_name, "@") if fallback else None
+            return None
+        details = item.snippet.super_chat_details
+        amount = clean_whitespace_from_message(details.amount_display_string) if details.HasField("amount_display_string") else ""
+        comment = clean_whitespace_and_youtube_emotes_from_message(details.user_comment) if details.HasField("user_comment") else ""
+        msg = f"{amount}SC:{comment}" if comment else f"{amount}SC"
+        return format_message_with_username_and_truncate(msg.strip(), author_display_name, "@")
+
+    if event_type == type_enum.SUPER_STICKER_EVENT:
+        if not item.snippet.HasField("super_sticker_details"):
+            return None
+        details = item.snippet.super_sticker_details
+        amount = clean_whitespace_from_message(details.amount_display_string) if details.HasField("amount_display_string") else ""
+        sticker_label = " Super Sticker" if lang == "en" else "超级贴纸"
+        msg = f"{amount}{sticker_label}".strip()
+        return format_message_with_username_and_truncate(msg, author_display_name, "@")
+
+    if event_type == type_enum.NEW_SPONSOR_EVENT:
+        level = ""
+        is_upgrade = False
+        if item.snippet.HasField("new_sponsor_details"):
+            details = item.snippet.new_sponsor_details
+            if details.HasField("member_level_name"):
+                level = clean_whitespace_from_message(details.member_level_name)
+            is_upgrade = bool(details.HasField("is_upgrade") and details.is_upgrade)
+        if lang == "en":
+            action = "Upgraded" if is_upgrade else "New"
+            msg = f"{action} {level} Membership".replace("  ", " ").strip()
+        else:
+            action = "升级了" if is_upgrade else "加入了"
+            msg = f"{action}{level}会员" if level else f"{action}会员"
+        return format_message_with_username_and_truncate(msg, author_display_name, "@")
+
+    if event_type == type_enum.MEMBER_MILESTONE_CHAT_EVENT:
+        months = 0
+        comment = ""
+        if item.snippet.HasField("member_milestone_chat_details"):
+            details = item.snippet.member_milestone_chat_details
+            if details.HasField("member_month"):
+                months = details.member_month
+            if details.HasField("user_comment"):
+                comment = clean_whitespace_and_youtube_emotes_from_message(details.user_comment)
+        if lang == "en":
+            prefix = f"Member {months}mo" if months > 0 else "Member Milestone"
+        else:
+            prefix = f"会员{months}个月" if months > 0 else "会员里程碑"
+        msg = f"{prefix}:{comment}" if comment else prefix
+        return format_message_with_username_and_truncate(msg, author_display_name, "@")
+
+    if event_type == type_enum.MEMBERSHIP_GIFTING_EVENT:
+        count = 1
+        if item.snippet.HasField("membership_gifting_details"):
+            details = item.snippet.membership_gifting_details
+            if details.HasField("gift_memberships_count") and details.gift_memberships_count > 0:
+                count = details.gift_memberships_count
+        msg = f"Gifted {count} Memberships!" if lang == "en" else f"赠送了{count}个会员"
+        return format_message_with_username_and_truncate(msg, author_display_name, "@")
+
+    if event_type == type_enum.GIFT_MEMBERSHIP_RECEIVED_EVENT:
+        level = ""
+        if item.snippet.HasField("gift_membership_received_details"):
+            details = item.snippet.gift_membership_received_details
+            if details.HasField("member_level_name"):
+                level = clean_whitespace_from_message(details.member_level_name)
+        if lang == "en":
+            msg = f"Received {level} Gift Membership".replace("  ", " ").strip()
+        else:
+            msg = f"收到了赠送的{level}会员" if level else "收到了赠送的会员"
+        return format_message_with_username_and_truncate(msg, author_display_name, "@")
+
+    if event_type == type_enum.POLL_EVENT:
+        question = ""
+        is_closed = False
+        if item.snippet.HasField("poll_details"):
+            details = item.snippet.poll_details
+            is_closed = details.HasField("status") and (
+                details.status == stream_list_pb2.LiveChatPollDetails.PollStatusWrapper.CLOSED
+            )
+            if details.HasField("metadata") and details.metadata.HasField("question_text"):
+                question = clean_whitespace_from_message(details.metadata.question_text)
+        if lang == "en":
+            prefix = "Poll Ended" if is_closed else "Poll"
+        else:
+            prefix = "投票结束" if is_closed else "发起投票"
+        msg = f"{prefix}:{question}" if question else prefix
+        return format_message_with_username_and_truncate(msg, author_display_name, "@")
+
+    if event_type == type_enum.FAN_FUNDING_EVENT:
+        if item.snippet.HasField("display_message"):
+            funding_text = clean_whitespace_from_message(item.snippet.display_message)
+            if funding_text:
+                return format_message_with_username_and_truncate(funding_text, author_display_name, "@")
+        return None
+
+    # Ignore internal/moderation/state events: INVALID_TYPE, TOMBSTONE,
+    # SPONSOR_ONLY_MODE_STARTED_EVENT, SPONSOR_ONLY_MODE_ENDED_EVENT,
+    # MESSAGE_DELETED_EVENT, MESSAGE_RETRACTED_EVENT, USER_BANNED_EVENT
+    return None
+
 def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_queue, main_loop):
     global active_grpc_call
     creds = grpc.ssl_channel_credentials()
@@ -553,61 +690,9 @@ def run_grpc_stream_with_reconnect(active_live_chat_id, api_key, chat_message_qu
                                     has_live_stream_ended = True
                                     break
 
-                                saw_new_chat_items = True
-                                author_display_name = item.author_details.display_name if item.HasField("author_details") else "unknown"
-
-                                if event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.TEXT_MESSAGE_EVENT:
-                                    if item.snippet.HasField("text_message_details"):
-                                        raw_text = item.snippet.text_message_details.message_text
-                                    elif item.snippet.HasField("display_message"):
-                                        raw_text = item.snippet.display_message
-                                    else:
-                                        continue
-
-                                    cleaned_chat = clean_whitespace_and_youtube_emotes_from_message(raw_text)
-                                    if is_text_empty_or_only_punctuation(cleaned_chat):
-                                        continue
-                                    formatted_msg = format_message_with_username_and_truncate(cleaned_chat, author_display_name, "@")
-                                    enqueue_msg("[YT]", formatted_msg)
-
-                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_CHAT_EVENT:
-                                    if item.snippet.HasField("super_chat_details"):
-                                        details = item.snippet.super_chat_details
-                                        amount = details.amount_display_string if details.HasField("amount_display_string") else ""
-                                        comment = details.user_comment if details.HasField("user_comment") else ""
-                                        msg = f"{comment} {amount}".strip()
-                                        formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                        enqueue_msg("[YT]", formatted_msg)
-
-                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.SUPER_STICKER_EVENT:
-                                    if item.snippet.HasField("super_sticker_details"):
-                                        details = item.snippet.super_sticker_details
-                                        amount = details.amount_display_string if details.HasField("amount_display_string") else ""
-                                        lang = config.get("OUTPUT_LANGUAGE", "en")
-                                        sticker_name = "Super Sticker" if lang == "en" else "超级贴纸"
-                                        msg = f"{sticker_name} {amount}".strip()
-                                        formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                        enqueue_msg("[YT]", formatted_msg)
-
-                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.NEW_SPONSOR_EVENT:
-                                    lang = config.get("OUTPUT_LANGUAGE", "en")
-                                    msg = "New Membership!" if lang == "en" else "新会员！"
-                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                    enqueue_msg("[YT]", formatted_msg)
-
-                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.MEMBERSHIP_GIFTING_EVENT:
-                                    if item.snippet.HasField("membership_gifting_details"):
-                                        details = item.snippet.membership_gifting_details
-                                        count = details.gift_memberships_count if details.HasField("gift_memberships_count") else 1
-                                        lang = config.get("OUTPUT_LANGUAGE", "en")
-                                        msg = f"Gifted {count} Memberships!" if lang == "en" else f"赠送了 {count} 个会员！"
-                                        formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
-                                        enqueue_msg("[YT]", formatted_msg)
-
-                                elif event_type == stream_list_pb2.LiveChatMessageSnippet.TypeWrapper.GIFT_MEMBERSHIP_RECEIVED_EVENT:
-                                    lang = config.get("OUTPUT_LANGUAGE", "en")
-                                    msg = "Received a Gift Membership!" if lang == "en" else "收到了赠送的会员！"
-                                    formatted_msg = format_message_with_username_and_truncate(msg, author_display_name, "@")
+                                formatted_msg = format_youtube_live_chat_item(item)
+                                if formatted_msg:
+                                    saw_new_chat_items = True
                                     enqueue_msg("[YT]", formatted_msg)
 
                             if response.next_page_token:
