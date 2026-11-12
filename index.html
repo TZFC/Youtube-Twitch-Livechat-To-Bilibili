@@ -298,6 +298,20 @@
             margin-top: 12px;
             margin-bottom: 12px;
         }
+        .manual-cookie-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+            flex-wrap: wrap;
+        }
+        .manual-cookie-actions .bili-btn {
+            flex: 0 0 auto;
+        }
+        .manual-cookie-status {
+            font-size: 13px;
+            color: #5f6368;
+        }
 
         /* Modal styles */
         .modal-overlay {
@@ -388,7 +402,7 @@
             </div>
             <div class="bili-auth-actions">
                 <button type="button" id="checkUpdateBtn" class="bili-btn secondary-btn" onclick="checkForUpdates(true)">🔍 Check</button>
-                <button type="button" id="updateAppBtn" class="bili-btn primary-btn" onclick="triggerAppUpdate()">⬆️ Update</button>
+                <button type="button" id="updateAppBtn" class="bili-btn primary-btn" onclick="triggerAppUpdate()" disabled>⬆️ Update</button>
             </div>
         </div>
     </div>
@@ -472,6 +486,10 @@
                 </div>
             </div>
             <input type="hidden" name="BUVID4" id="BUVID4">
+            <div class="manual-cookie-actions">
+                <button type="button" id="biliSaveCookiesBtn" class="bili-btn primary-btn" onclick="saveManualBilibiliCookies()">💾 Save & Check Cookies</button>
+                <span id="biliSaveStatusText" class="manual-cookie-status"></span>
+            </div>
         </details>
 
         <div class="section-title">Source Platforms</div>
@@ -578,23 +596,29 @@
                     text.textContent = `Current: ${data.current_version} -> New: ${data.latest_version}`;
                     updateBtn.className = 'bili-btn update-available-btn';
                     updateBtn.textContent = `⬆️ Update (${data.latest_version})`;
+                    updateBtn.disabled = false;
                 } else {
                     dot.className = 'status-dot green';
                     text.textContent = `Version: ${data.current_version} (Up to date)`;
                     updateBtn.className = 'bili-btn primary-btn';
-                    updateBtn.textContent = '⬆️ Update';
+                    updateBtn.textContent = '⬆️ Up to Date';
+                    updateBtn.disabled = true;
                 }
             } else {
+                latestUpdateAvailable = false;
                 dot.className = 'status-dot';
                 text.textContent = `Version: ${data.current_version || 'unknown'} (Check failed)`;
+                updateBtn.disabled = true;
                 if (manual && data.message) {
                     alert('Failed to check updates: ' + data.message);
                 }
             }
         } catch (e) {
             console.error('Update check failed', e);
+            latestUpdateAvailable = false;
             dot.className = 'status-dot';
             text.textContent = 'Update check error';
+            updateBtn.disabled = true;
             if (manual) {
                 alert('Failed to check updates: ' + e.message);
             }
@@ -636,10 +660,9 @@
         const text = document.getElementById('updateStatusText');
 
         if (!latestUpdateAvailable) {
-            const proceed = confirm(
-                `You appear to be on the latest version${latestReleaseTag ? ' (' + latestReleaseTag + ')' : ''}.\nDownload and reinstall the latest release anyway? Your config.json will be kept.`
-            );
-            if (!proceed) return;
+            alert(`No newer version available${latestReleaseTag ? ' (latest release: ' + latestReleaseTag + ')' : ''}. Downgrades and same-version overwrites are disabled.`);
+            updateBtn.disabled = true;
+            return;
         }
 
         updateBtn.disabled = true;
@@ -658,12 +681,23 @@
                 dot.className = 'status-dot green';
                 text.textContent = `Updated to ${data.updated_version}. Restarting server...`;
                 await waitForRestartAndReload(data.updated_version);
+            } else if (data.status === 'up_to_date') {
+                isUpdatingApp = false;
+                latestUpdateAvailable = false;
+                dot.className = 'status-dot green';
+                text.textContent = `Version: ${data.updated_version} (Up to date)`;
+                updateBtn.className = 'bili-btn primary-btn';
+                updateBtn.textContent = '⬆️ Up to Date';
+                updateBtn.disabled = true;
+                checkBtn.disabled = false;
+                alert(data.message || 'Already on the latest version. No update performed.');
+                await checkStatus();
             } else {
                 isUpdatingApp = false;
                 dot.className = 'status-dot red';
                 text.textContent = 'Update failed (config preserved)';
                 alert('Update failed: ' + (data.message || 'Unknown error'));
-                updateBtn.disabled = false;
+                updateBtn.disabled = !latestUpdateAvailable;
                 checkBtn.disabled = false;
                 updateBtn.textContent = latestUpdateAvailable && latestReleaseTag ? `⬆️ Update (${latestReleaseTag})` : '⬆️ Update';
                 await checkStatus();
@@ -673,7 +707,7 @@
             dot.className = 'status-dot red';
             text.textContent = 'Update error (config preserved)';
             alert('Update error: ' + e.message);
-            updateBtn.disabled = false;
+            updateBtn.disabled = !latestUpdateAvailable;
             checkBtn.disabled = false;
             updateBtn.textContent = '⬆️ Update';
             await checkStatus();
@@ -688,7 +722,10 @@
             const data = await res.json();
             if (data.logged_in) {
                 dot.className = "status-dot green";
-                text.textContent = `Logged in (UID: ${data.dedeuserid})`;
+                text.textContent = data.dedeuserid ? `Logged in (UID: ${data.dedeuserid})` : "Logged in";
+            } else if (data.error) {
+                dot.className = "status-dot red";
+                text.textContent = `Login check failed: ${data.error}`;
             } else if (data.needs_refresh) {
                 dot.className = "status-dot yellow";
                 text.textContent = `Session needs refresh (UID: ${data.dedeuserid || 'Unknown'})`;
@@ -696,10 +733,12 @@
                 dot.className = "status-dot red";
                 text.textContent = data.dedeuserid ? `Session expired (UID: ${data.dedeuserid})` : "Not logged in";
             }
+            return data;
         } catch (e) {
             console.error("Failed to check Bilibili status", e);
             dot.className = "status-dot";
             text.textContent = "Error checking Bilibili status";
+            return null;
         }
     }
 
@@ -786,6 +825,68 @@
             }
         } catch (e) {
             console.error("Polling error", e);
+        }
+    }
+
+    async function saveManualBilibiliCookies() {
+        const btn = document.getElementById('biliSaveCookiesBtn');
+        const saveStatus = document.getElementById('biliSaveStatusText');
+        const dot = document.getElementById('biliStatusDot');
+        const statusTextEl = document.getElementById('biliStatusText');
+
+        btn.disabled = true;
+        btn.textContent = 'Saving & Checking...';
+        saveStatus.textContent = 'Saving cookies to config.json...';
+        dot.className = 'status-dot';
+        statusTextEl.textContent = 'Checking login status...';
+
+        const cookieKeys = ['SESSDATA', 'BILI_JCT', 'BUVID3', 'BUVID4', 'DEDEUSERID', 'AC_TIME_VALUE'];
+        for (const key of cookieKeys) {
+            if (form.elements[key] && typeof form.elements[key].value === 'string') {
+                form.elements[key].value = form.elements[key].value.trim();
+            }
+        }
+
+        const formData = new FormData(form);
+        const configData = Object.fromEntries(formData.entries());
+
+        try {
+            const saveRes = await fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(configData)
+            });
+            const saveData = await saveRes.json();
+            if (!saveRes.ok || saveData.status !== 'ok') {
+                throw new Error(saveData.message || 'Failed to save config.json');
+            }
+
+            saveStatus.textContent = 'Saved. Running cookie refresh check...';
+            const refreshRes = await fetch('/api/bilibili/refresh?force=false', { method: 'POST' });
+            const refreshData = await refreshRes.json();
+
+            await loadConfig();
+            const biliStatus = await checkBilibiliStatus();
+
+            if (refreshData.status === 'refreshed') {
+                saveStatus.textContent = 'Saved & cookies refreshed!';
+            } else if (refreshData.status === 'ok' || refreshData.valid) {
+                saveStatus.textContent = refreshData.message || 'Saved! Cookies are active.';
+            } else if (refreshData.message) {
+                saveStatus.textContent = refreshData.message;
+                if (!biliStatus || (!biliStatus.logged_in && !biliStatus.error)) {
+                    dot.className = refreshData.status === 'missing_token' ? 'status-dot yellow' : 'status-dot red';
+                    statusTextEl.textContent = refreshData.message;
+                }
+            }
+        } catch (e) {
+            console.error('Failed to save cookies', e);
+            saveStatus.textContent = 'Error: ' + e.message;
+            dot.className = 'status-dot red';
+            statusTextEl.textContent = 'Failed to save/check cookies: ' + e.message;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '💾 Save & Check Cookies';
         }
     }
 

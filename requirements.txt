@@ -1,4 +1,5 @@
 bilibili-api-python
+curl_cffi
 google-api-python-client
 requests
 fastapi

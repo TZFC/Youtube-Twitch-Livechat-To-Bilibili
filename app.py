@@ -32,7 +32,15 @@ import stream_list_pb2_grpc
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from bilibili_api import Credential, Danmaku, login_v2
+from bilibili_api import (
+    Credential,
+    Danmaku,
+    login_v2,
+    get_registered_clients,
+    get_selected_client,
+    select_client,
+    register_client,
+)
 from bilibili_api.exceptions import NetworkException, ResponseCodeException
 from bilibili_api.utils.network import get_buvid, Api
 from bilibili_api.live import LiveRoom, API as LIVE_API
@@ -85,6 +93,37 @@ def save_config():
 
 load_config()
 
+def ensure_bilibili_http_client() -> tuple[bool, str]:
+    """Ensure bilibili_api has a registered and selected async HTTP client."""
+    try:
+        client_name, _ = get_selected_client()
+        return True, client_name
+    except Exception:
+        pass
+
+    try:
+        registered = get_registered_clients()
+        for preferred in ("curl_cffi", "aiohttp", "httpx"):
+            if preferred in registered:
+                select_client(preferred)
+                return True, preferred
+
+        import importlib
+        from bilibili_api.clients import ALL_PROVIDED_CLIENTS
+        for module_name, client_cls_name, settings in ALL_PROVIDED_CLIENTS:
+            try:
+                importlib.import_module(module_name)
+                client_mod = importlib.import_module(f"bilibili_api.clients.{client_cls_name}")
+                client_cls = getattr(client_mod, client_cls_name)
+                register_client(module_name, client_cls, settings)
+                return True, module_name
+            except Exception:
+                continue
+    except Exception as e:
+        return False, f"Failed to initialize Bilibili HTTP client: {e}"
+
+    return False, "No Bilibili HTTP client library available (please install curl_cffi)"
+
 def build_bilibili_credential() -> Credential:
     return Credential(
         sessdata=config.get("SESSDATA", ""),
@@ -98,15 +137,27 @@ def build_bilibili_credential() -> Credential:
 async def check_and_refresh_bilibili_credentials(force: bool = False) -> dict:
     global config
     if not config.get("SESSDATA"):
-        return {"status": "no_credentials", "message": "No SESSDATA configured", "valid": False}
+        return {"status": "no_credentials", "message": "No SESSDATA configured", "valid": False, "needs_refresh": False}
+
+    client_ok, client_info = ensure_bilibili_http_client()
+    if not client_ok:
+        msg = f"Failed to verify/refresh Bilibili cookies: {client_info}"
+        add_log(msg)
+        return {"status": "error", "message": msg, "valid": False, "needs_refresh": False}
 
     cred = build_bilibili_credential()
 
     is_valid = False
+    check_valid_error = None
     try:
         is_valid = await cred.check_valid()
-    except Exception:
-        is_valid = False
+    except Exception as e:
+        check_valid_error = e
+
+    if check_valid_error is not None:
+        msg = f"Failed to verify Bilibili cookies: {check_valid_error}"
+        add_log(msg)
+        return {"status": "error", "message": msg, "valid": False, "needs_refresh": False}
 
     needs_refresh = False
     try:
@@ -118,9 +169,17 @@ async def check_and_refresh_bilibili_credentials(force: bool = False) -> dict:
 
     if should_refresh:
         if not config.get("AC_TIME_VALUE"):
+            if force and is_valid and not needs_refresh:
+                return {
+                    "status": "ok",
+                    "valid": True,
+                    "needs_refresh": False,
+                    "message": "Cookies are valid (no refresh needed; AC_TIME_VALUE not configured)"
+                }
             msg = "Bilibili cookies need refresh, but no AC_TIME_VALUE (refresh token) is present. Please re-login via QR code."
-            add_log(msg)
-            return {"status": "missing_token", "message": msg, "valid": is_valid}
+            if not is_valid or needs_refresh:
+                add_log(msg)
+            return {"status": "missing_token", "message": msg, "valid": is_valid, "needs_refresh": needs_refresh}
 
         try:
             add_log("Attempting Bilibili cookie refresh with AC_TIME_VALUE...")
@@ -131,11 +190,11 @@ async def check_and_refresh_bilibili_credentials(force: bool = False) -> dict:
             config["AC_TIME_VALUE"] = cred.ac_time_value or ""
             save_config()
             add_log("Bilibili cookies successfully refreshed and updated in config.json!")
-            return {"status": "refreshed", "message": "Cookies refreshed successfully", "valid": True}
+            return {"status": "refreshed", "message": "Cookies refreshed successfully", "valid": True, "needs_refresh": False}
         except Exception as e:
             msg = f"Failed to refresh Bilibili cookies: {e}. Please re-login via QR code."
             add_log(msg)
-            return {"status": "error", "message": msg, "valid": is_valid}
+            return {"status": "error", "message": msg, "valid": is_valid, "needs_refresh": needs_refresh}
 
     return {
         "status": "ok" if is_valid else "invalid",
@@ -999,10 +1058,28 @@ def api_get_status():
     }
 
 def _parse_semver(tag: str) -> tuple:
-    nums = re.findall(r"\d+", str(tag or ""))
+    nums = [int(n) for n in re.findall(r"\d+", str(tag or ""))]
     if not nums:
-        return (0,)
-    return tuple(int(n) for n in nums)
+        return ()
+    while len(nums) > 1 and nums[-1] == 0:
+        nums.pop()
+    return tuple(nums)
+
+def is_newer_version(candidate_tag: str, current_tag: str) -> bool:
+    candidate_ver = _parse_semver(candidate_tag)
+    current_ver = _parse_semver(current_tag)
+    if not candidate_ver:
+        return False
+    if not current_ver:
+        return True
+    return candidate_ver > current_ver
+
+def _version_not_newer_message(candidate_tag: str, current_tag: str) -> str:
+    candidate_ver = _parse_semver(candidate_tag)
+    current_ver = _parse_semver(current_tag)
+    if candidate_ver and current_ver and candidate_ver < current_ver:
+        return f"Update rejected: release {candidate_tag} is older than installed version {current_tag} (downgrade is not allowed)."
+    return f"Already on version {current_tag} (latest release is {candidate_tag}); no newer version available."
 
 def _get_version_marker_path(base_dir: str = APP_DIR) -> str:
     python_dir = os.path.join(base_dir, "python")
@@ -1141,6 +1218,17 @@ def apply_github_release_update(base_dir: str = APP_DIR, release_info: dict = No
         release_info = fetch_latest_github_release()
 
     latest_tag = release_info["tag_name"]
+    if not is_newer_version(latest_tag, previous_version):
+        return {
+            "status": "up_to_date",
+            "previous_version": previous_version,
+            "updated_version": previous_version,
+            "latest_version": latest_tag,
+            "updated_files": 0,
+            "config_preserved": True,
+            "message": _version_not_newer_message(latest_tag, previous_version),
+        }
+
     temp_dir = tempfile.mkdtemp(prefix="yt_bili_update_")
     config_path = os.path.join(base_dir, CONFIG_FILE)
     config_backup_bytes = None
@@ -1248,7 +1336,7 @@ async def api_update_check():
     try:
         release_info = await asyncio.to_thread(fetch_latest_github_release)
         latest_version = release_info["tag_name"]
-        update_available = _parse_semver(latest_version) > _parse_semver(current_version)
+        update_available = is_newer_version(latest_version, current_version)
         return {
             "status": "ok",
             "current_version": current_version,
@@ -1270,16 +1358,34 @@ async def api_update_check():
 @app.post("/api/update")
 async def api_perform_update():
     global shutdown_event, bridge_task
-    if bridge_task and not bridge_task.done():
-        if shutdown_event:
-            shutdown_event.set()
-        cancel_active_grpc_stream()
-        add_log("Stopping bridge tasks for application update...")
-        await bridge_task
-        bridge_task = None
-
     try:
-        result = await asyncio.to_thread(apply_github_release_update)
+        current_version = get_installed_version()
+        release_info = await asyncio.to_thread(fetch_latest_github_release)
+        latest_version = release_info["tag_name"]
+        if not is_newer_version(latest_version, current_version):
+            return {
+                "status": "up_to_date",
+                "previous_version": current_version,
+                "updated_version": current_version,
+                "latest_version": latest_version,
+                "updated_files": 0,
+                "config_preserved": True,
+                "restarting": False,
+                "message": _version_not_newer_message(latest_version, current_version),
+            }
+
+        if bridge_task and not bridge_task.done():
+            if shutdown_event:
+                shutdown_event.set()
+            cancel_active_grpc_stream()
+            add_log("Stopping bridge tasks for application update...")
+            await bridge_task
+            bridge_task = None
+
+        result = await asyncio.to_thread(apply_github_release_update, APP_DIR, release_info)
+        if result.get("status") != "updated":
+            result["restarting"] = False
+            return result
         add_log(f"Updated application from {result['previous_version']} to {result['updated_version']} (config.json preserved). Restarting...")
         _schedule_self_restart(delay_seconds=0.8)
         result["restarting"] = True
@@ -1311,30 +1417,47 @@ async def api_bilibili_status():
             "has_ac_time_value": False
         }
 
+    client_ok, client_info = ensure_bilibili_http_client()
+    if not client_ok:
+        return {
+            "logged_in": False,
+            "valid": False,
+            "needs_refresh": False,
+            "dedeuserid": str(config.get("DEDEUSERID", "")),
+            "has_ac_time_value": bool(config.get("AC_TIME_VALUE")),
+            "error": client_info
+        }
+
     cred = build_bilibili_credential()
     is_valid = False
     needs_refresh = False
+    check_error = None
     try:
         is_valid = await cred.check_valid()
-    except Exception:
+    except Exception as e:
+        check_error = str(e)
         is_valid = False
 
-    try:
-        needs_refresh = await cred.check_refresh()
-    except Exception:
-        needs_refresh = False
+    if check_error is None:
+        try:
+            needs_refresh = await cred.check_refresh()
+        except Exception:
+            needs_refresh = False
 
-    return {
+    result = {
         "logged_in": is_valid,
         "valid": is_valid,
         "needs_refresh": needs_refresh,
         "dedeuserid": str(config.get("DEDEUSERID", "")),
         "has_ac_time_value": bool(config.get("AC_TIME_VALUE"))
     }
+    if check_error is not None:
+        result["error"] = check_error
+    return result
 
 @app.post("/api/bilibili/refresh")
-async def api_bilibili_refresh():
-    result = await check_and_refresh_bilibili_credentials(force=True)
+async def api_bilibili_refresh(force: bool = True):
+    result = await check_and_refresh_bilibili_credentials(force=force)
     return result
 
 @app.post("/api/bilibili/qrcode/start")
@@ -1485,6 +1608,9 @@ async def api_bilibili_qrcode_poll(session_id: str):
 async def api_save_config(request: Request):
     global config, channel_id_cache
     new_config = await request.json()
+    for cookie_key in ("SESSDATA", "BILI_JCT", "BUVID3", "BUVID4", "DEDEUSERID", "AC_TIME_VALUE"):
+        if cookie_key in new_config and isinstance(new_config[cookie_key], str):
+            new_config[cookie_key] = new_config[cookie_key].strip()
     config.update(new_config)
     channel_id_cache.clear()
     save_config()
